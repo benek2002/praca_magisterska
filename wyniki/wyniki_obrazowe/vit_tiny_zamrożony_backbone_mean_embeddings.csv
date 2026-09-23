@@ -1,0 +1,6 @@
+target,model,R2,MAE
+Rm_MPa,ViT-Tiny_backbone_zamrozony,0.771,70.8
+Rp02_MPa,ViT-Tiny_backbone_zamrozony,0.814,60.4
+A_pct,ViT-Tiny_backbone_zamrozony,0.457,2.35
+impact_J,ViT-Tiny_backbone_zamrozony,-0.162,17.4
+HB,ViT-Tiny_backbone_zamrozony,0.732,15.6

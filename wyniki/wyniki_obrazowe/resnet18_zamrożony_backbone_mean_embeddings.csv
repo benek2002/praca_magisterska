@@ -1,0 +1,6 @@
+target,model,R2,MAE
+Rm_MPa,ResNet18_backbone_zamrozony,0.323,112.1
+Rp02_MPa,ResNet18_backbone_zamrozony,0.606,81.2
+A_pct,ResNet18_backbone_zamrozony,0.527,2.03
+impact_J,ResNet18_backbone_zamrozony,-0.031,15.7
+HB,ResNet18_backbone_zamrozony,0.415,23.0

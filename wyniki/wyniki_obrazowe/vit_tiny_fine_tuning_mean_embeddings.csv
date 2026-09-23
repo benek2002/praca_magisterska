@@ -1,0 +1,6 @@
+target,model,R2,MAE
+Rm_MPa,ViT-Tiny_ostatni_blok_odmrozony,0.726,76.7
+Rp02_MPa,ViT-Tiny_ostatni_blok_odmrozony,0.717,74.5
+A_pct,ViT-Tiny_ostatni_blok_odmrozony,0.525,2.1
+impact_J,ViT-Tiny_ostatni_blok_odmrozony,-0.143,17.3
+HB,ViT-Tiny_ostatni_blok_odmrozony,0.619,15.9

@@ -1,0 +1,6 @@
+target,model,R2,MAE
+Rm_MPa,ResNet18_layer4_odmrozona,0.588,89.7
+Rp02_MPa,ResNet18_layer4_odmrozona,0.734,73.8
+A_pct,ResNet18_layer4_odmrozona,0.412,2.45
+impact_J,ResNet18_layer4_odmrozona,-0.132,16.9
+HB,ResNet18_layer4_odmrozona,0.487,21.0
