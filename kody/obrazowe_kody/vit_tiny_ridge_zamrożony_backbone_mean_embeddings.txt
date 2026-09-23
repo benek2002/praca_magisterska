@@ -1,0 +1,420 @@
+import os
+import gc
+import glob
+import json
+import shutil
+import warnings
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+import torch
+from torchvision import transforms
+
+try:
+    import timm
+except ImportError:
+    os.system("pip install timm -q")
+    import timm
+
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.model_selection import LeaveOneGroupOut
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+
+
+ROOT_DIR = "ścieżka do obrazów"
+CSV_PATH = "ścieżka do pliku CSV"
+
+RESULTS_DIR = "ścieżka do wyników"
+PROGRESS_DIR = "ścieżka do postępu"
+RESUME_DATASET = "ścieżka do datasetu z checkpointami"
+
+for directory in [RESULTS_DIR, PROGRESS_DIR]:
+    os.makedirs(directory, exist_ok=True)
+
+
+TARGETS = ["Rm_MPa", "Rp02_MPa", "A_pct", "impact_J", "HB"]
+IMG_SIZE = 224
+BATCH_SIZE = 64
+IMG_EXTS = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+EMBED_DIM = 192
+
+
+def restore_progress():
+    previous_progress = os.path.join(
+        RESUME_DATASET,
+        "vit_ridge",
+        "progress"
+    )
+
+    if not os.path.exists(previous_progress):
+        return
+
+    for file_path in glob.glob(os.path.join(previous_progress, "*.json")):
+        destination = os.path.join(
+            PROGRESS_DIR,
+            os.path.basename(file_path)
+        )
+
+        if not os.path.exists(destination):
+            shutil.copy(file_path, destination)
+
+
+def fold_path(target, fold_idx):
+    return os.path.join(
+        PROGRESS_DIR,
+        f"{target}_fold{fold_idx + 1}.json"
+    )
+
+
+def save_fold(target, fold_idx, true_val, pred_val, stop_name, n_imgs):
+    with open(fold_path(target, fold_idx), "w") as file:
+        json.dump(
+            {
+                "true": true_val,
+                "pred": pred_val,
+                "stop": stop_name,
+                "n_imgs": n_imgs,
+            },
+            file
+        )
+
+
+def load_fold(target, fold_idx):
+    path = fold_path(target, fold_idx)
+
+    if os.path.exists(path):
+        with open(path) as file:
+            return json.load(file)
+
+    return None
+
+
+backbone = timm.create_model(
+    "vit_tiny_patch16_224",
+    pretrained=True,
+    num_classes=0
+)
+
+for parameter in backbone.parameters():
+    parameter.requires_grad = False
+
+backbone = backbone.to(DEVICE).eval()
+
+
+img_tf = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225]
+    ),
+])
+
+
+def extract_folder_name(value):
+    return str(value).strip().replace("\\", "/").split("/")[-1]
+
+
+def build_folder_path(key, root):
+    exact_path = os.path.join(root, key)
+
+    if os.path.isdir(exact_path):
+        return exact_path
+
+    if not hasattr(build_folder_path, "_map"):
+        try:
+            entries = os.listdir(root)
+        except FileNotFoundError:
+            entries = []
+
+        build_folder_path._map = {
+            entry.lower().strip(): entry
+            for entry in entries
+        }
+
+    match = build_folder_path._map.get(key.lower().strip())
+
+    return os.path.join(root, match) if match else exact_path
+
+
+def get_image_paths(folder):
+    paths = []
+
+    for extension in IMG_EXTS:
+        paths += glob.glob(os.path.join(folder, extension))
+
+    return sorted(paths)
+
+
+def embed_folder(folder_path):
+    paths = get_image_paths(folder_path)
+
+    if not paths:
+        return np.zeros(EMBED_DIM)
+
+    embeddings = []
+
+    for i in range(0, len(paths), BATCH_SIZE):
+        batch = paths[i:i + BATCH_SIZE]
+
+        images = torch.stack([
+            img_tf(Image.open(path).convert("RGB"))
+            for path in batch
+        ]).to(DEVICE)
+
+        with torch.no_grad():
+            batch_embeddings = backbone(images)
+
+        embeddings.append(batch_embeddings.cpu().numpy())
+
+    embeddings = np.concatenate(embeddings, axis=0)
+
+    return embeddings.mean(axis=0)
+
+
+restore_progress()
+
+
+df_raw = pd.read_csv(CSV_PATH)
+df_raw["folder_key"] = df_raw["folder_1000x"].apply(
+    extract_folder_name
+)
+
+df_agg = (
+    df_raw
+    .groupby("folder_key", as_index=False)
+    .agg({target: "first" for target in TARGETS})
+)
+
+df_agg["folder_path"] = df_agg["folder_key"].apply(
+    lambda key: build_folder_path(key, ROOT_DIR)
+)
+
+df_agg = (
+    df_agg[
+        df_agg["folder_path"].apply(os.path.isdir)
+    ]
+    .reset_index(drop=True)
+)
+
+
+emb_cache = {}
+
+for _, row in df_agg.iterrows():
+    key = row["folder_key"]
+    emb_cache[key] = embed_folder(row["folder_path"])
+
+
+logo = LeaveOneGroupOut()
+
+all_results = []
+detail_rows = []
+
+
+for target in TARGETS:
+
+    sub = (
+        df_agg
+        .dropna(subset=[target])
+        .reset_index(drop=True)
+    )
+
+    groups = np.arange(len(sub))
+    y = sub[target].values.astype(np.float32)
+
+    if len(sub) < 3:
+        continue
+
+    y_true_all = []
+    y_pred_all = []
+
+    for fold_idx in range(len(sub)):
+        cached_fold = load_fold(target, fold_idx)
+
+        if cached_fold is None:
+            continue
+
+        y_true_all.append(cached_fold["true"])
+        y_pred_all.append(cached_fold["pred"])
+
+    for fold_idx, (train_idx, test_idx) in enumerate(
+        logo.split(sub, y, groups=groups)
+    ):
+
+        if load_fold(target, fold_idx) is not None:
+            continue
+
+        test_i = int(test_idx[0])
+
+        stop = sub.loc[test_i, "folder_key"]
+        true_value = float(y[test_i])
+
+        X_train = np.stack([
+            emb_cache[sub.loc[i, "folder_key"]]
+            for i in train_idx
+        ])
+
+        y_train = y[train_idx]
+
+        X_test = emb_cache[stop].reshape(1, -1)
+
+        scaler = StandardScaler()
+
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+
+        model = Ridge()
+        model.fit(X_train_scaled, y_train)
+
+        prediction = float(
+            model.predict(X_test_scaled)[0]
+        )
+
+        absolute_error = abs(true_value - prediction)
+
+        relative_error = (
+            absolute_error /
+            (abs(true_value) + 1e-8)
+            * 100
+        )
+
+        save_fold(
+            target,
+            fold_idx,
+            true_value,
+            prediction,
+            stop,
+            len(get_image_paths(sub.loc[test_i, "folder_path"]))
+        )
+
+        y_true_all.append(true_value)
+        y_pred_all.append(prediction)
+
+        detail_rows.append({
+            "target": target,
+            "fold": fold_idx + 1,
+            "stop": stop,
+            "true": round(true_value, 3),
+            "pred": round(prediction, 3),
+            "abs_err": round(absolute_error, 3),
+            "rel_err_pct": round(relative_error, 2),
+        })
+
+        gc.collect()
+
+    if len(y_true_all) < 2:
+        continue
+
+    y_true = np.array(y_true_all)
+    y_pred = np.array(y_pred_all)
+
+    r2 = r2_score(y_true, y_pred)
+    mae = mean_absolute_error(y_true, y_pred)
+
+    rmse = float(
+        np.sqrt(
+            np.mean(
+                (y_true - y_pred) ** 2
+            )
+        )
+    )
+
+    mape = float(
+        np.mean(
+            np.abs(y_true - y_pred) /
+            (np.abs(y_true) + 1e-8)
+        ) * 100
+    )
+
+    all_results.append({
+        "target": target,
+        "n_stops": len(y_true),
+        "R2": round(r2, 4),
+        "MAE": round(mae, 3),
+        "RMSE": round(rmse, 3),
+        "MAPE_pct": round(mape, 2),
+    })
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+
+    ax.scatter(
+        y_true,
+        y_pred,
+        color="steelblue",
+        edgecolors="k",
+        s=70,
+        zorder=3
+    )
+
+    margin = (y_true.max() - y_true.min()) * 0.05
+
+    limits = (
+        min(y_true.min(), y_pred.min()) - margin,
+        max(y_true.max(), y_pred.max()) + margin
+    )
+
+    ax.plot(
+        limits,
+        limits,
+        "r--",
+        lw=1.5,
+        label="ideał"
+    )
+
+    ax.set_xlim(limits)
+    ax.set_ylim(limits)
+
+    ax.set_xlabel(
+        f"Wartość rzeczywista [{target}]"
+    )
+    ax.set_ylabel(
+        "Predykcja Ridge (α=1.0)"
+    )
+
+    ax.set_title(
+        f"ViT-Tiny Frozen + Ridge (default)\n"
+        f"{target}  R²={r2:.3f}  "
+        f"MAE={mae:.1f}  "
+        f"RMSE={rmse:.1f}"
+    )
+
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    plt.savefig(
+        os.path.join(
+            RESULTS_DIR,
+            f"scatter_{target}.png"
+        ),
+        dpi=150
+    )
+
+    plt.close()
+
+
+summary_df = pd.DataFrame(all_results)
+
+summary_df.to_csv(
+    os.path.join(RESULTS_DIR, "summary.csv"),
+    index=False
+)
+
+pd.DataFrame(detail_rows).to_csv(
+    os.path.join(RESULTS_DIR, "per_fold.csv"),
+    index=False
+)
+
+
+print(summary_df)

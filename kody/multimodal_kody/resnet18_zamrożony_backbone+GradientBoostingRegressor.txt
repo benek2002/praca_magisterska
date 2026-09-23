@@ -1,0 +1,1285 @@
+import os
+import gc
+import glob
+import json
+import shutil
+import warnings
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+import torch
+import torch.nn as nn
+from torchvision import transforms, models
+
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.model_selection import LeaveOneGroupOut
+
+import shap
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+
+
+ROOT_DIR = "ścieżka do obrazów"
+CSV_PATH = "ścieżka do pliku CSV"
+
+RESULTS_DIR = "ścieżka do wyników"
+SHAP_DIR = "ścieżka do map SHAP"
+PROGRESS_DIR = "ścieżka do postępu"
+
+RESUME_DATASET = "ścieżka do datasetu z checkpointami"
+
+for directory in [RESULTS_DIR, SHAP_DIR, PROGRESS_DIR]:
+    os.makedirs(directory, exist_ok=True)
+
+
+TARGETS = [
+    "Rm_MPa",
+    "Rp02_MPa",
+    "A_pct",
+    "impact_J",
+    "HB",
+]
+
+TABULAR_COLS = [
+    "grubosc_mm",
+    "T_aust_C",
+    "t_aust_min",
+    "T_hart_C",
+    "t_hart_min",
+    "chem_C",
+    "chem_Si",
+    "chem_Mn",
+    "chem_S",
+    "chem_P",
+    "chem_Mg",
+    "chem_Cu",
+    "chem_Ni",
+]
+
+N_PCA = 13
+IMG_SIZE = 224
+BATCH_SIZE = 64
+SEED = 42
+
+IMG_EXTS = (
+    "*.jpg",
+    "*.jpeg",
+    "*.png",
+    "*.bmp",
+    "*.tif",
+    "*.tiff",
+)
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+print(f"Device: {DEVICE}")
+print(
+    f"Wymiar GBT: PCA({N_PCA}) + "
+    f"Tab({len(TABULAR_COLS)}) = "
+    f"{N_PCA + len(TABULAR_COLS)}D"
+)
+
+
+def restore_progress():
+    source_dir = os.path.join(
+        RESUME_DATASET,
+        "progress_hybrid_pca13_gbt"
+    )
+
+    if not os.path.exists(source_dir):
+        print("Brak poprzedniego postępu. Zaczynam od początku.")
+        return
+
+    restored = 0
+
+    for path in glob.glob(os.path.join(source_dir, "*.json")):
+        destination = os.path.join(
+            PROGRESS_DIR,
+            os.path.basename(path)
+        )
+
+        if not os.path.exists(destination):
+            shutil.copy(path, destination)
+            restored += 1
+
+    print(
+        f"Skopiowano {restored} plików progress "
+        f"z poprzedniej sesji."
+    )
+
+
+restore_progress()
+
+
+def fold_done_path(target, fold_idx):
+    return os.path.join(
+        PROGRESS_DIR,
+        f"{target}_fold{fold_idx + 1}.json"
+    )
+
+
+def save_fold(
+    target,
+    fold_idx,
+    true_val,
+    pred_val,
+    stop,
+    n_imgs
+):
+    data = {
+        "true": true_val,
+        "pred": pred_val,
+        "stop": stop,
+        "n_imgs": n_imgs,
+    }
+
+    with open(
+        fold_done_path(target, fold_idx),
+        "w"
+    ) as file:
+        json.dump(data, file)
+
+
+def load_fold(target, fold_idx):
+    path = fold_done_path(target, fold_idx)
+
+    if not os.path.exists(path):
+        return None
+
+    with open(path) as file:
+        return json.load(file)
+
+
+backbone = models.resnet18(
+    weights=models.ResNet18_Weights.IMAGENET1K_V1
+)
+
+backbone = nn.Sequential(
+    *list(backbone.children())[:-1]
+)
+
+for parameter in backbone.parameters():
+    parameter.requires_grad = False
+
+backbone = backbone.to(DEVICE)
+backbone.eval()
+
+n_params = sum(
+    parameter.numel()
+    for parameter in backbone.parameters()
+)
+
+print(
+    f"Backbone: {n_params:,} parametrów - "
+    f"wszystkie zamrożone"
+)
+
+
+img_transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225]
+    ),
+])
+
+
+def extract_folder_name(value):
+    return (
+        str(value)
+        .strip()
+        .replace("\\", "/")
+        .split("/")[-1]
+    )
+
+
+def get_image_paths(folder):
+    paths = []
+
+    for extension in IMG_EXTS:
+        paths += glob.glob(
+            os.path.join(folder, extension)
+        )
+
+    return sorted(paths)
+
+
+def get_mean_embedding(folder_path):
+    paths = get_image_paths(folder_path)
+
+    if not paths:
+        return None, 0
+
+    embeddings = []
+
+    for start in range(
+        0,
+        len(paths),
+        BATCH_SIZE
+    ):
+        batch_paths = paths[
+            start:start + BATCH_SIZE
+        ]
+
+        images = torch.stack([
+            img_transform(
+                Image.open(path).convert("RGB")
+            )
+            for path in batch_paths
+        ]).to(DEVICE)
+
+        with torch.no_grad():
+            output = backbone(images)
+            output = output.squeeze(-1).squeeze(-1)
+
+        embeddings.append(
+            output.cpu().numpy()
+        )
+
+    embedding_matrix = np.concatenate(
+        embeddings,
+        axis=0
+    )
+
+    return (
+        embedding_matrix.mean(axis=0),
+        len(paths)
+    )
+
+
+df_raw = pd.read_csv(CSV_PATH)
+
+df_raw["folder_key"] = (
+    df_raw["folder_1000x"]
+    .apply(extract_folder_name)
+)
+
+agg_dict = {
+    target: "first"
+    for target in TARGETS
+}
+
+agg_dict.update({
+    column: "first"
+    for column in TABULAR_COLS
+    if column in df_raw.columns
+})
+
+df_agg = (
+    df_raw
+    .groupby("folder_key")
+    .agg(agg_dict)
+    .reset_index()
+)
+
+df_agg["folder_path"] = df_agg[
+    "folder_key"
+].apply(
+    lambda value: os.path.join(
+        ROOT_DIR,
+        value
+    )
+)
+
+df_agg = df_agg[
+    df_agg["folder_path"].apply(os.path.isdir)
+].reset_index(drop=True)
+
+TABULAR_COLS = [
+    column
+    for column in TABULAR_COLS
+    if column in df_agg.columns
+]
+
+TAB_NAMES = TABULAR_COLS
+
+print(f"Stopów: {len(df_agg)}")
+print(
+    f"Cechy tabelaryczne ({len(TABULAR_COLS)}): "
+    f"{TABULAR_COLS}"
+)
+
+assert len(TAB_NAMES) == N_PCA, (
+    f"N_PCA={N_PCA} != "
+    f"len(TAB_NAMES)={len(TAB_NAMES)}"
+)
+
+
+print("Ekstrakcja embeddingów ResNet18...")
+
+emb_512 = np.zeros(
+    (len(df_agg), 512),
+    dtype=np.float32
+)
+
+n_imgs_per_stop = []
+
+for index, row in df_agg.iterrows():
+    embedding, n_images = get_mean_embedding(
+        row["folder_path"]
+    )
+
+    if embedding is not None:
+        emb_512[index] = embedding
+
+    n_imgs_per_stop.append(n_images)
+
+    print(
+        f"[{index + 1:2d}/{len(df_agg)}] "
+        f"{row['folder_key']:35s} | "
+        f"zdjęć={n_images:3d}"
+    )
+
+print(
+    f"\nMacierz embeddingów: {emb_512.shape}"
+)
+
+
+def feat_names():
+    return [
+        f"pc_{index}"
+        for index in range(N_PCA)
+    ] + TAB_NAMES
+
+
+def plot_shap_per_fold(
+    shap_values,
+    target,
+    fold_idx,
+    stop,
+    true_val,
+    pred_val
+):
+    image_abs = float(
+        np.abs(shap_values[:N_PCA]).sum()
+    )
+
+    table_abs = float(
+        np.abs(shap_values[N_PCA:]).sum()
+    )
+
+    total = image_abs + table_abs + 1e-8
+
+    target_dir = os.path.join(
+        SHAP_DIR,
+        target
+    )
+
+    os.makedirs(
+        target_dir,
+        exist_ok=True
+    )
+
+    prefix = os.path.join(
+        target_dir,
+        f"fold{fold_idx + 1}_{stop[:18]}"
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(5, 3)
+    )
+
+    bars = ax.bar(
+        [
+            f"Obraz\n(PCA {N_PCA}D)",
+            f"Tabela\n(raw {len(TAB_NAMES)}D)"
+        ],
+        [image_abs, table_abs],
+        color=[
+            "steelblue",
+            "darkorange"
+        ],
+        edgecolor="k"
+    )
+
+    ax.bar_label(
+        bars,
+        fmt="%.3f",
+        padding=3
+    )
+
+    ax.set_ylabel("|SHAP| suma")
+
+    ax.set_title(
+        f"{target} | {stop[:22]}\n"
+        f"Obraz={100 * image_abs / total:.1f}%  "
+        f"Tabela={100 * table_abs / total:.1f}%\n"
+        f"true={true_val:.1f}  pred={pred_val:.1f}"
+    )
+
+    ax.grid(
+        True,
+        alpha=0.3,
+        axis="y"
+    )
+
+    plt.tight_layout()
+
+    plt.savefig(
+        f"{prefix}_modal.png",
+        dpi=120,
+        bbox_inches="tight"
+    )
+
+    plt.close()
+
+    table_shap = shap_values[N_PCA:]
+
+    sort_indices = np.argsort(
+        np.abs(table_shap)
+    )[::-1]
+
+    colors = [
+        "tomato" if value > 0 else "steelblue"
+        for value in table_shap[sort_indices]
+    ]
+
+    fig, ax = plt.subplots(
+        figsize=(6, 4)
+    )
+
+    ax.barh(
+        [
+            TAB_NAMES[index]
+            for index in sort_indices
+        ],
+        table_shap[sort_indices],
+        color=colors,
+        edgecolor="k"
+    )
+
+    ax.axvline(
+        0,
+        color="k",
+        lw=0.8
+    )
+
+    ax.set_xlabel("SHAP value")
+
+    ax.set_title(
+        f"SHAP - cechy tabelaryczne\n"
+        f"{target} | {stop[:22]}\n"
+        f"true={true_val:.1f}  pred={pred_val:.1f}"
+    )
+
+    ax.grid(
+        True,
+        alpha=0.3,
+        axis="x"
+    )
+
+    plt.tight_layout()
+
+    plt.savefig(
+        f"{prefix}_tab.png",
+        dpi=120,
+        bbox_inches="tight"
+    )
+
+    plt.close()
+
+    return image_abs, table_abs
+
+
+def save_shap_summary(
+    all_rows,
+    all_values,
+    all_X,
+    target
+):
+    if len(all_values) < 2:
+        return
+
+    shap_matrix = np.stack(
+        all_values,
+        axis=0
+    )
+
+    X_matrix = np.stack(
+        all_X,
+        axis=0
+    )
+
+    names = feat_names()
+
+    target_dir = os.path.join(
+        SHAP_DIR,
+        target
+    )
+
+    os.makedirs(
+        target_dir,
+        exist_ok=True
+    )
+
+    shap.summary_plot(
+        shap_matrix,
+        X_matrix,
+        feature_names=names,
+        show=False,
+        max_display=26
+    )
+
+    plt.title(
+        f"SHAP beeswarm - {target}"
+    )
+
+    plt.tight_layout()
+
+    plt.savefig(
+        os.path.join(
+            target_dir,
+            "beeswarm_all.png"
+        ),
+        dpi=130,
+        bbox_inches="tight"
+    )
+
+    plt.close()
+
+    mean_table = np.abs(
+        shap_matrix[:, N_PCA:]
+    ).mean(axis=0)
+
+    sort_indices = np.argsort(
+        mean_table
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(7, 4)
+    )
+
+    ax.barh(
+        [
+            TAB_NAMES[index]
+            for index in sort_indices
+        ],
+        mean_table[sort_indices],
+        color="darkorange",
+        edgecolor="k"
+    )
+
+    ax.set_xlabel(
+        "Średni |SHAP|"
+    )
+
+    ax.set_title(
+        f"Ważność cech tabelarycznych\n"
+        f"{target} "
+        f"(uśrednione, {len(all_values)} foldów LOGO)"
+    )
+
+    ax.grid(
+        True,
+        alpha=0.3,
+        axis="x"
+    )
+
+    plt.tight_layout()
+
+    plt.savefig(
+        os.path.join(
+            target_dir,
+            "tab_importance_mean.png"
+        ),
+        dpi=130,
+        bbox_inches="tight"
+    )
+
+    plt.close()
+
+    shap_df = pd.DataFrame(
+        all_rows
+    )
+
+    shap_df.to_csv(
+        os.path.join(
+            RESULTS_DIR,
+            f"shap_{target}.csv"
+        ),
+        index=False
+    )
+
+    avg_image = shap_df[
+        "shap_img_pct"
+    ].mean()
+
+    avg_table = shap_df[
+        "shap_tab_pct"
+    ].mean()
+
+    fig, ax = plt.subplots(
+        figsize=(6, 3)
+    )
+
+    bars = ax.barh(
+        [
+            f"Obraz (PCA {N_PCA}D)",
+            f"Tabela (raw {len(TAB_NAMES)}D)"
+        ],
+        [avg_image, avg_table],
+        color=[
+            "steelblue",
+            "darkorange"
+        ],
+        edgecolor="k"
+    )
+
+    for index, value in enumerate(
+        [avg_image, avg_table]
+    ):
+        ax.text(
+            value + 0.5,
+            index,
+            f"{value:.1f}%",
+            va="center",
+            fontsize=11,
+            fontweight="bold"
+        )
+
+    ax.set_xlabel(
+        "Średni wkład modalności [%]"
+    )
+
+    ax.set_title(
+        f"Wkład modalności - {target}\n"
+        f"({len(shap_df)} foldów LOGO)"
+    )
+
+    ax.set_xlim(0, 105)
+
+    ax.grid(
+        True,
+        alpha=0.3,
+        axis="x"
+    )
+
+    plt.tight_layout()
+
+    plt.savefig(
+        os.path.join(
+            target_dir,
+            "modality_contribution.png"
+        ),
+        dpi=130,
+        bbox_inches="tight"
+    )
+
+    plt.close()
+
+    top_indices = np.argsort(
+        mean_table
+    )[::-1][:3]
+
+    top_features = ", ".join([
+        f"{TAB_NAMES[index]}="
+        f"{mean_table[index]:.3f}"
+        for index in top_indices
+    ])
+
+    print(
+        f"SHAP modalności: "
+        f"Obraz={avg_image:.1f}%  "
+        f"Tabela={avg_table:.1f}%"
+    )
+
+    print(
+        f"Top 3 cechy tabelaryczne: "
+        f"{top_features}"
+    )
+
+
+logo = LeaveOneGroupOut()
+
+all_results = []
+detail_rows = []
+
+
+for target in TARGETS:
+
+    sub = (
+        df_agg
+        .dropna(subset=[target])
+        .reset_index(drop=True)
+    )
+
+    groups = np.arange(len(sub))
+
+    y = sub[target].values.astype(
+        np.float32
+    )
+
+    E = emb_512[:len(sub)]
+
+    print(
+        f"\n{'=' * 65}"
+    )
+
+    print(
+        f"TARGET: {target} "
+        f"({len(sub)} stopów)"
+    )
+
+    print(
+        f"{'=' * 65}"
+    )
+
+    if len(sub) < 3:
+        print(
+            "Za mało danych - pomijam"
+        )
+        continue
+
+    y_true_all = []
+    y_pred_all = []
+
+    all_shap_rows = []
+    all_shap_values = []
+    all_X_test = []
+
+    for fold_index in range(len(sub)):
+
+        cached = load_fold(
+            target,
+            fold_index
+        )
+
+        if cached is None:
+            continue
+
+        y_true_all.append(
+            cached["true"]
+        )
+
+        y_pred_all.append(
+            cached["pred"]
+        )
+
+        error = abs(
+            cached["true"] -
+            cached["pred"]
+        )
+
+        print(
+            f"Fold {fold_index + 1:2d} "
+            f"[{cached['stop']:35s}] "
+            f"RESUME "
+            f"true={cached['true']:7.1f} "
+            f"pred={cached['pred']:7.1f} "
+            f"|err|={error:6.1f}"
+        )
+
+        detail_rows.append({
+            "target": target,
+            "fold": fold_index + 1,
+            "stop": cached["stop"],
+            "n_imgs": cached["n_imgs"],
+            "true": round(
+                cached["true"],
+                3
+            ),
+            "pred": round(
+                cached["pred"],
+                3
+            ),
+            "abs_err": round(
+                error,
+                3
+            ),
+            "rel_err_pct": round(
+                error /
+                (abs(cached["true"]) + 1e-8) *
+                100,
+                2
+            ),
+        })
+
+    for fold_index, (
+        train_idx,
+        test_idx
+    ) in enumerate(
+        logo.split(
+            sub,
+            y,
+            groups=groups
+        )
+    ):
+
+        if load_fold(
+            target,
+            fold_index
+        ) is not None:
+            continue
+
+        test_index = int(
+            test_idx[0]
+        )
+
+        stop = sub.loc[
+            test_index,
+            "folder_key"
+        ]
+
+        n_images = n_imgs_per_stop[
+            test_index
+        ]
+
+        X_tab_raw = sub[
+            TABULAR_COLS
+        ].copy()
+
+        train_median = X_tab_raw.iloc[
+            train_idx
+        ].median()
+
+        X_tab_raw = X_tab_raw.fillna(
+            train_median
+        )
+
+        scaler = StandardScaler()
+
+        X_tab_train = scaler.fit_transform(
+            X_tab_raw.iloc[
+                train_idx
+            ].values
+        ).astype(np.float32)
+
+        X_tab_test = scaler.transform(
+            X_tab_raw.iloc[
+                [test_index]
+            ].values
+        ).astype(np.float32)
+
+        n_components = min(
+            N_PCA,
+            len(train_idx) - 1
+        )
+
+        pca = PCA(
+            n_components=n_components,
+            random_state=SEED
+        )
+
+        E_train_pca = pca.fit_transform(
+            E[train_idx]
+        )
+
+        E_test_pca = pca.transform(
+            E[[test_index]]
+        )
+
+        if n_components < N_PCA:
+            padding = N_PCA - n_components
+
+            E_train_pca = np.pad(
+                E_train_pca,
+                ((0, 0), (0, padding))
+            )
+
+            E_test_pca = np.pad(
+                E_test_pca,
+                ((0, 0), (0, padding))
+            )
+
+        explained_variance = (
+            pca.explained_variance_ratio_.sum()
+            * 100
+        )
+
+        X_train = np.concatenate(
+            [
+                E_train_pca,
+                X_tab_train
+            ],
+            axis=1
+        )
+
+        X_test = np.concatenate(
+            [
+                E_test_pca,
+                X_tab_test
+            ],
+            axis=1
+        )
+
+        gbt = GradientBoostingRegressor(
+            n_estimators=100,
+            max_depth=2,
+            learning_rate=0.1,
+            subsample=0.8,
+            min_samples_leaf=2,
+            random_state=SEED,
+        )
+
+        gbt.fit(
+            X_train,
+            y[train_idx]
+        )
+
+        prediction = float(
+            gbt.predict(X_test)[0]
+        )
+
+        true_value = float(
+            y[test_index]
+        )
+
+        error_abs = abs(
+            true_value -
+            prediction
+        )
+
+        error_pct = (
+            error_abs /
+            (abs(true_value) + 1e-8) *
+            100
+        )
+
+        print(
+            f"Fold {fold_index + 1:2d} "
+            f"[{stop:35s}] "
+            f"true={true_value:7.1f} "
+            f"pred={prediction:7.1f} "
+            f"|err|={error_abs:6.1f} "
+            f"({error_pct:.1f}%) "
+            f"PCA var={explained_variance:.1f}%"
+        )
+
+        explainer = shap.TreeExplainer(
+            gbt
+        )
+
+        shap_values = explainer.shap_values(
+            X_test
+        )
+
+        shap_values = shap_values[0]
+
+        image_abs, table_abs = (
+            plot_shap_per_fold(
+                shap_values,
+                target,
+                fold_index,
+                stop,
+                true_value,
+                prediction
+            )
+        )
+
+        total_shap = (
+            image_abs +
+            table_abs +
+            1e-8
+        )
+
+        all_shap_rows.append({
+            "target": target,
+            "fold": fold_index + 1,
+            "stop": stop,
+            "true": true_value,
+            "pred": prediction,
+            "pca_var_pct": round(
+                explained_variance,
+                1
+            ),
+            "shap_img_abs": round(
+                image_abs,
+                4
+            ),
+            "shap_tab_abs": round(
+                table_abs,
+                4
+            ),
+            "shap_img_pct": round(
+                100 * image_abs /
+                total_shap,
+                1
+            ),
+            "shap_tab_pct": round(
+                100 * table_abs /
+                total_shap,
+                1
+            ),
+            **{
+                f"shap_{name}": round(
+                    float(
+                        shap_values[
+                            N_PCA + index
+                        ]
+                    ),
+                    6
+                )
+                for index, name
+                in enumerate(TAB_NAMES)
+            },
+        })
+
+        all_shap_values.append(
+            shap_values
+        )
+
+        all_X_test.append(
+            X_test[0]
+        )
+
+        save_fold(
+            target,
+            fold_index,
+            true_value,
+            prediction,
+            stop,
+            n_images
+        )
+
+        y_true_all.append(
+            true_value
+        )
+
+        y_pred_all.append(
+            prediction
+        )
+
+        detail_rows.append({
+            "target": target,
+            "fold": fold_index + 1,
+            "stop": stop,
+            "n_imgs": n_images,
+            "true": round(
+                true_value,
+                3
+            ),
+            "pred": round(
+                prediction,
+                3
+            ),
+            "abs_err": round(
+                error_abs,
+                3
+            ),
+            "rel_err_pct": round(
+                error_pct,
+                2
+            ),
+        })
+
+        del gbt
+        gc.collect()
+
+    if len(y_true_all) < 2:
+        continue
+
+    y_true = np.array(
+        y_true_all
+    )
+
+    y_pred = np.array(
+        y_pred_all
+    )
+
+    r2 = r2_score(
+        y_true,
+        y_pred
+    )
+
+    mae = mean_absolute_error(
+        y_true,
+        y_pred
+    )
+
+    rmse = float(
+        np.sqrt(
+            np.mean(
+                (y_true - y_pred) ** 2
+            )
+        )
+    )
+
+    mape = float(
+        np.mean(
+            np.abs(
+                (y_true - y_pred) /
+                (np.abs(y_true) + 1e-8)
+            )
+        ) * 100
+    )
+
+    all_results.append({
+        "target": target,
+        "model": (
+            f"Hybrid_ResNet18frozen_"
+            f"PCA{N_PCA}_GBT"
+        ),
+        "n_stops": len(y_true),
+        "R2": round(
+            r2,
+            4
+        ),
+        "MAE": round(
+            mae,
+            3
+        ),
+        "RMSE": round(
+            rmse,
+            3
+        ),
+        "MAPE_pct": round(
+            mape,
+            2
+        ),
+    })
+
+    print(
+        f"\n{target}  "
+        f"R²={r2:.3f}  "
+        f"MAE={mae:.3f}  "
+        f"RMSE={rmse:.3f}  "
+        f"MAPE={mape:.1f}%"
+    )
+
+    if all_shap_values:
+        save_shap_summary(
+            all_shap_rows,
+            all_shap_values,
+            all_X_test,
+            target
+        )
+
+    fig, ax = plt.subplots(
+        figsize=(5, 5)
+    )
+
+    ax.scatter(
+        y_true,
+        y_pred,
+        color="steelblue",
+        edgecolors="k",
+        s=70,
+        zorder=3
+    )
+
+    for true_value, prediction, label in zip(
+        y_true,
+        y_pred,
+        sub["folder_key"]
+    ):
+        ax.annotate(
+            str(label)[:12],
+            (true_value, prediction),
+            fontsize=6,
+            xytext=(3, 3),
+            textcoords="offset points"
+        )
+
+    limits = [
+        min(
+            y_true.min(),
+            y_pred.min()
+        ) * 0.95,
+        max(
+            y_true.max(),
+            y_pred.max()
+        ) * 1.05
+    ]
+
+    ax.plot(
+        limits,
+        limits,
+        "r--",
+        lw=1.5,
+        label="ideał"
+    )
+
+    ax.set_xlabel(
+        f"Wartość rzeczywista [{target}]"
+    )
+
+    ax.set_ylabel(
+        f"Predykcja [{target}]"
+    )
+
+    ax.set_title(
+        f"ResNet18 Frozen + PCA(13) + Tab(13) + GBT\n"
+        f"{target}  R²={r2:.3f}  "
+        f"MAE={mae:.1f}  "
+        f"MAPE={mape:.1f}%"
+    )
+
+    ax.legend()
+    ax.grid(
+        True,
+        alpha=0.3
+    )
+
+    plt.tight_layout()
+
+    plt.savefig(
+        os.path.join(
+            RESULTS_DIR,
+            f"scatter_{target}.png"
+        ),
+        dpi=150
+    )
+
+    plt.close()
+
+
+summary_df = pd.DataFrame(
+    all_results
+)
+
+summary_df.to_csv(
+    os.path.join(
+        RESULTS_DIR,
+        "summary.csv"
+    ),
+    index=False
+)
+
+pd.DataFrame(
+    detail_rows
+).to_csv(
+    os.path.join(
+        RESULTS_DIR,
+        "per_fold.csv"
+    ),
+    index=False
+)
+
+print("\nWYNIKI KOŃCOWE")
+
+print(
+    summary_df[
+        [
+            "target",
+            "n_stops",
+            "R2",
+            "MAE",
+            "RMSE",
+            "MAPE_pct"
+        ]
+    ].to_string(index=False)
+)
+
+print(
+    f"\nWyniki: {RESULTS_DIR}/summary.csv"
+)
+
+print(
+    f"Per-fold: {RESULTS_DIR}/per_fold.csv"
+)
+
+print(
+    f"SHAP: {SHAP_DIR}/"
+)

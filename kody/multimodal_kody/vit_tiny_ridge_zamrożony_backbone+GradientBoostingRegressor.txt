@@ -1,0 +1,359 @@
+import os, gc, glob, json, shutil, warnings
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+import torch
+from torchvision import transforms
+
+try:
+    import timm
+except ImportError:
+    os.system("pip install timm -q")
+    import timm
+
+from sklearn.linear_model import Ridge
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.model_selection import LeaveOneGroupOut
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+
+ROOT_DIR = "ROOT_DIR"
+CSV_PATH = "CSV_PATH"
+
+RESULTS_DIR  = "RESULTS_DIR"
+PROGRESS_DIR = "PROGRESS_DIR"
+
+for d in [RESULTS_DIR, PROGRESS_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+RESUME_DATASET = "RESUME_DATASET"
+
+TARGETS = ["Rm_MPa", "Rp02_MPa", "A_pct", "impact_J", "HB"]
+
+TABULAR_COLS = [
+    "grubosc_mm",
+    "T_aust_C", "t_aust_min",
+    "T_hart_C", "t_hart_min",
+    "chem_C",   "chem_Si",  "chem_Mn",
+    "chem_S",   "chem_P",   "chem_Mg",
+    "chem_Cu",  "chem_Ni",
+]
+
+IMG_SIZE   = 224
+BATCH_SIZE = 64
+SEED       = 42
+IMG_EXTS   = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff")
+DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+VIT_MODEL_NAME = "vit_tiny_patch16_224"
+VIT_EMBED_DIM  = 192
+
+AGGREGATIONS = ["mean", "std"]
+
+print(f"Device: {DEVICE}")
+print(f"Backbone: {VIT_MODEL_NAME}  embed_dim={VIT_EMBED_DIM}  ZAMROZONY")
+print(f"Regressor: Ridge (alpha=1.0 default)")
+print(f"Agregacje: {AGGREGATIONS}\n")
+
+
+def restore_progress():
+    prev = os.path.join(RESUME_DATASET, "hybrid_vittiny_ridge", "progress")
+    if not os.path.exists(prev):
+        print("Brak poprzedniego postepu - zaczynam od poczatku.")
+        return
+    n = 0
+    for f in glob.glob(os.path.join(prev, "*.json")):
+        dst = os.path.join(PROGRESS_DIR, os.path.basename(f))
+        if not os.path.exists(dst):
+            shutil.copy(f, dst)
+            n += 1
+    print(f"Skopiowano {n} plikow progress.")
+
+print("===== RESUME =====")
+restore_progress()
+print("==================\n")
+
+
+def fold_done_path(target, agg, fold_idx):
+    return os.path.join(PROGRESS_DIR, f"{target}_{agg}_fold{fold_idx+1}.json")
+
+def save_fold(target, agg, fold_idx, data: dict):
+    with open(fold_done_path(target, agg, fold_idx), "w") as f:
+        json.dump(data, f)
+
+def load_fold(target, agg, fold_idx):
+    p = fold_done_path(target, agg, fold_idx)
+    if not os.path.exists(p):
+        return None
+    with open(p) as f:
+        return json.load(f)
+
+
+backbone = timm.create_model(VIT_MODEL_NAME, pretrained=True, num_classes=0)
+for p in backbone.parameters():
+    p.requires_grad = False
+backbone = backbone.to(DEVICE).eval()
+
+n_params = sum(p.numel() for p in backbone.parameters())
+print(f"Backbone params: {n_params:,} - WSZYSTKIE ZAMROZONE\n")
+
+img_transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406],
+                         [0.229, 0.224, 0.225]),
+])
+
+
+def extract_folder_name(x):
+    return str(x).strip().replace("\\", "/").split("/")[-1]
+
+def build_folder_path(key, root):
+    exact = os.path.join(root, key)
+    if os.path.isdir(exact):
+        return exact
+    if not hasattr(build_folder_path, "_map"):
+        try:
+            entries = os.listdir(root)
+        except FileNotFoundError:
+            entries = []
+        build_folder_path._map = {e.lower().strip(): e for e in entries}
+    match = build_folder_path._map.get(key.lower().strip())
+    return os.path.join(root, match) if match else exact
+
+def get_image_paths(folder):
+    paths = []
+    for ext in IMG_EXTS:
+        paths += glob.glob(os.path.join(folder, ext))
+    return sorted(paths)
+
+def get_all_embeddings(folder_path):
+    paths = get_image_paths(folder_path)
+    if not paths:
+        return None, 0
+    batch_embs = []
+    for i in range(0, len(paths), BATCH_SIZE):
+        batch = paths[i:i + BATCH_SIZE]
+        imgs  = torch.stack([
+            img_transform(Image.open(p).convert("RGB")) for p in batch
+        ]).to(DEVICE)
+        with torch.no_grad():
+            out = backbone(imgs)
+        batch_embs.append(out.cpu().numpy())
+    emb_matrix = np.concatenate(batch_embs, axis=0)
+    return emb_matrix, len(paths)
+
+
+df_raw = pd.read_csv(CSV_PATH)
+df_raw["folder_key"] = df_raw["folder_1000x"].apply(extract_folder_name)
+
+agg_dict = {t: "first" for t in TARGETS}
+agg_dict.update({c: "first" for c in TABULAR_COLS if c in df_raw.columns})
+df_agg = df_raw.groupby("folder_key").agg(agg_dict).reset_index()
+df_agg["folder_path"] = df_agg["folder_key"].apply(
+    lambda k: build_folder_path(k, ROOT_DIR)
+)
+df_agg = df_agg[df_agg["folder_path"].apply(os.path.isdir)].reset_index(drop=True)
+
+TABULAR_COLS = [c for c in TABULAR_COLS if c in df_agg.columns]
+N_TAB = len(TABULAR_COLS)
+
+print(f"Stopow: {len(df_agg)}")
+print(f"Cechy tabelaryczne ({N_TAB}): {TABULAR_COLS}")
+print(f"Wymiar Ridge: PCA({N_TAB}) + Tab({N_TAB}) = {2*N_TAB}D\n")
+
+
+print("Pre-ekstrakcja embeddingow per zdjecie...")
+raw_emb_dict = {}
+n_imgs_dict  = {}
+
+for _, row in df_agg.iterrows():
+    key = row["folder_key"]
+    emb_matrix, n = get_all_embeddings(row["folder_path"])
+    if emb_matrix is None:
+        emb_matrix = np.zeros((1, VIT_EMBED_DIM))
+        n = 0
+    raw_emb_dict[key] = emb_matrix
+    n_imgs_dict[key]  = n
+    print(f"  {key:35s} | {n:3d} zdjec -> ({emb_matrix.shape[0]}, {VIT_EMBED_DIM})")
+
+def get_agg_embedding(folder_key, agg_type):
+    m = raw_emb_dict[folder_key]
+    if m.shape[0] == 1 and agg_type == "std":
+        return np.zeros(VIT_EMBED_DIM, dtype=np.float32)
+    if agg_type == "mean":
+        return m.mean(axis=0).astype(np.float32)
+    elif agg_type == "std":
+        return m.std(axis=0, ddof=0).astype(np.float32)
+    raise ValueError(agg_type)
+
+print("\nEmbeddingi gotowe. Agregacja (mean/std) liczona per fold.\n")
+
+
+logo        = LeaveOneGroupOut()
+all_results = []
+detail_rows = []
+
+for agg_type in AGGREGATIONS:
+    print(f"\n{'#'*70}")
+    print(f"# AGREGACJA: {agg_type.upper()}")
+    print(f"{'#'*70}")
+
+    for target in TARGETS:
+        sub = df_agg.dropna(subset=[target]).reset_index(drop=True)
+        grp = np.arange(len(sub))
+        y   = sub[target].values.astype(np.float32)
+        E   = np.stack([get_agg_embedding(k, agg_type) for k in sub["folder_key"]])
+
+        print(f"\n{'='*65}")
+        print(f"TARGET: {target}  ({len(sub)} stopow)  agg={agg_type}")
+        print(f"{'='*65}")
+
+        if len(sub) < 3:
+            print("  Za malo danych - pomijam")
+            continue
+
+        y_true_all, y_pred_all = [], []
+
+        for fi in range(len(sub)):
+            c = load_fold(target, agg_type, fi)
+            if c is None:
+                continue
+            y_true_all.append(c["true"])
+            y_pred_all.append(c["pred"])
+            err = abs(c["true"] - c["pred"])
+            print(f"  Fold {fi+1:2d} [{c['stop']:35s}] <- RESUME "
+                  f"true={c['true']:7.1f}  pred={c['pred']:7.1f}  |err|={err:6.1f}")
+            detail_rows.append({
+                "target": target, "agg": agg_type, "fold": fi+1,
+                "stop": c["stop"], "n_imgs": c["n_imgs"],
+                "true": round(c["true"], 3), "pred": round(c["pred"], 3),
+                "abs_err": round(err, 3),
+                "rel_err_pct": round(err/(abs(c["true"])+1e-8)*100, 2),
+            })
+
+        for fold_idx, (train_idx, test_idx) in enumerate(
+            logo.split(sub, y, groups=grp)
+        ):
+            if load_fold(target, agg_type, fold_idx) is not None:
+                continue
+
+            test_i = int(test_idx[0])
+            stop   = sub.loc[test_i, "folder_key"]
+            n_imgs = n_imgs_dict.get(stop, 0)
+
+            X_tab_raw   = sub[TABULAR_COLS].copy()
+            train_med   = X_tab_raw.iloc[train_idx].median()
+            X_tab_raw   = X_tab_raw.fillna(train_med)
+            scaler_tab  = StandardScaler()
+            X_tab_train = scaler_tab.fit_transform(
+                X_tab_raw.iloc[train_idx].values).astype(np.float32)
+            X_tab_test  = scaler_tab.transform(
+                X_tab_raw.iloc[[test_i]].values).astype(np.float32)
+
+            n_comp = min(N_TAB, len(train_idx) - 1)
+            pca    = PCA(n_components=n_comp, random_state=SEED)
+            E_train_pca = pca.fit_transform(E[train_idx])
+            E_test_pca  = pca.transform(E[[test_i]])
+            if n_comp < N_TAB:
+                pad = N_TAB - n_comp
+                E_train_pca = np.pad(E_train_pca, ((0, 0), (0, pad)))
+                E_test_pca  = np.pad(E_test_pca,  ((0, 0), (0, pad)))
+            var_explained = float(pca.explained_variance_ratio_.sum() * 100)
+
+            X_train = np.concatenate([E_train_pca, X_tab_train], axis=1)
+            X_test  = np.concatenate([E_test_pca,  X_tab_test],  axis=1)
+
+            model = Ridge(alpha=1.0)
+            model.fit(X_train, y[train_idx])
+
+            pred     = float(model.predict(X_test)[0])
+            true_val = float(y[test_i])
+            err_abs  = abs(true_val - pred)
+            err_pct  = err_abs / (abs(true_val) + 1e-8) * 100
+
+            print(
+                f"  Fold {fold_idx+1:2d} [{stop:35s}] "
+                f"true={true_val:7.1f}  pred={pred:7.1f}  "
+                f"|err|={err_abs:6.1f} ({err_pct:.1f}%)  "
+                f"PCA_var={var_explained:.1f}%"
+            )
+
+            save_fold(target, agg_type, fold_idx, {
+                "true": true_val, "pred": pred, "stop": stop,
+                "n_imgs": n_imgs, "pca_var_pct": round(var_explained, 1),
+            })
+
+            y_true_all.append(true_val)
+            y_pred_all.append(pred)
+            detail_rows.append({
+                "target": target, "agg": agg_type, "fold": fold_idx+1,
+                "stop": stop, "n_imgs": n_imgs,
+                "true": round(true_val, 3), "pred": round(pred, 3),
+                "abs_err": round(err_abs, 3), "rel_err_pct": round(err_pct, 2),
+                "pca_var_pct": round(var_explained, 1),
+            })
+
+            gc.collect()
+
+        if len(y_true_all) < 2:
+            continue
+
+        y_t  = np.array(y_true_all)
+        y_p  = np.array(y_pred_all)
+        r2   = r2_score(y_t, y_p)
+        mae  = mean_absolute_error(y_t, y_p)
+        rmse = float(np.sqrt(np.mean((y_t - y_p) ** 2)))
+        mape = float(np.mean(np.abs((y_t - y_p) / (np.abs(y_t) + 1e-8))) * 100)
+
+        all_results.append({
+            "target":   target,
+            "model":    f"Hybrid_ViTtiny_frozen_PCA{N_TAB}_Ridge_{agg_type}",
+            "agg":      agg_type,
+            "n_stops":  len(y_t),
+            "R2":       round(r2, 4),
+            "MAE":      round(mae, 3),
+            "RMSE":     round(rmse, 3),
+            "MAPE_pct": round(mape, 2),
+        })
+        print(f"\n  >>> {target} [{agg_type}]  R2={r2:.3f}  MAE={mae:.3f}  "
+              f"RMSE={rmse:.3f}  MAPE={mape:.1f}%")
+
+        fig, ax = plt.subplots(figsize=(5, 5))
+        ax.scatter(y_t, y_p, color="seagreen", edgecolors="k", s=70, zorder=3)
+        lim = [min(y_t.min(), y_p.min()) * 0.95, max(y_t.max(), y_p.max()) * 1.05]
+        ax.plot(lim, lim, "r--", lw=1.5, label="idealna")
+        ax.set_xlabel(f"Wartosc rzeczywista [{target}]")
+        ax.set_ylabel(f"Predykcja [{target}]")
+        ax.set_title(f"Hybrid ViT-Tiny frozen + Tab -> Ridge ({agg_type})\n"
+                     f"{target}  R2={r2:.3f}  MAE={mae:.1f}")
+        ax.legend(); ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(RESULTS_DIR, f"scatter_{target}_{agg_type}.png"),
+                    dpi=150)
+        plt.close()
+
+
+summary_df = pd.DataFrame(all_results)
+summary_df.to_csv(os.path.join(RESULTS_DIR, "summary.csv"), index=False)
+pd.DataFrame(detail_rows).to_csv(
+    os.path.join(RESULTS_DIR, "per_fold.csv"), index=False)
+
+print("\n" + "=" * 70)
+print("WYNIKI KONCOWE (Hybrid ViT-Tiny frozen + Tab -> Ridge, mean/std):")
+print("=" * 70)
+print(summary_df[["target", "agg", "n_stops", "R2", "MAE", "RMSE", "MAPE_pct"]]
+      .to_string(index=False))
+
+pivot = summary_df.pivot_table(index="target", columns="agg", values="R2", aggfunc="max")
+print("\nR2 per target x agregacja:")
+print(pivot.to_string())
+
+print("DONE")

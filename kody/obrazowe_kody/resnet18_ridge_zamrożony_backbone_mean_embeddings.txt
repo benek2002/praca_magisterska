@@ -1,0 +1,695 @@
+import os
+import gc
+import glob
+import json
+import warnings
+import random
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+import torch
+import torch.nn as nn
+from torchvision import transforms, models
+
+from sklearn.linear_model import Ridge, RidgeCV
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.base import clone as sk_clone
+from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.model_selection import LeaveOneGroupOut
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+
+
+SEED = 42
+
+ROOT_DIR = "ścieżka do obrazów"
+CSV_PATH = "ścieżka do pliku CSV"
+EMBED_CACHE_IN = "ścieżka do wejściowego cache embeddingów"
+EMBED_CACHE_OUT = "ścieżka do wyjściowego cache embeddingów"
+RESULTS_DIR = "ścieżka do wyników"
+
+os.makedirs(RESULTS_DIR, exist_ok=True)
+os.makedirs(os.path.dirname(EMBED_CACHE_OUT), exist_ok=True)
+
+TARGETS = ["Rm_MPa", "Rp02_MPa", "A_pct", "impact_J", "HB"]
+IMG_EXTS = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff")
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH = 32
+IMG_SIZE = 224
+EMBED_DIM = 512
+
+ALPHAS = [
+    0.001, 0.01, 0.1, 1.0,
+    10.0, 100.0, 1000.0, 10000.0
+]
+
+random.seed(SEED)
+np.random.seed(SEED)
+
+if torch.cuda.is_available():
+    torch.manual_seed(SEED)
+
+print(f"Device: {DEVICE}")
+print("Backbone: ResNet18, ImageNet, frozen")
+print(f"Embedding: {EMBED_DIM}D")
+
+
+df_raw = pd.read_csv(CSV_PATH)
+
+
+def extract_folder_name(x):
+    return str(x).strip().replace("\\", "/").split("/")[-1]
+
+
+def build_folder_path(key, root):
+    exact = os.path.join(root, key)
+
+    if os.path.isdir(exact):
+        return exact
+
+    if not hasattr(build_folder_path, "_map"):
+        try:
+            entries = os.listdir(root)
+        except:
+            entries = []
+
+        build_folder_path._map = {
+            e.lower().strip(): e
+            for e in entries
+        }
+
+    match = build_folder_path._map.get(key.lower().strip())
+
+    return os.path.join(root, match) if match else exact
+
+
+df_raw["folder_key"] = df_raw["folder_1000x"].apply(
+    extract_folder_name
+)
+
+cols_needed = [
+    "folder_key"
+] + [
+    t for t in TARGETS
+    if t in df_raw.columns
+]
+
+df_agg = (
+    df_raw[cols_needed]
+    .groupby("folder_key", as_index=False)
+    .first()
+)
+
+df_agg["folder_path"] = df_agg["folder_key"].apply(
+    lambda k: build_folder_path(k, ROOT_DIR)
+)
+
+df_agg = df_agg[
+    df_agg["folder_path"].apply(os.path.isdir)
+].reset_index(drop=True)
+
+
+def get_image_paths(folder):
+    paths = []
+
+    for ext in IMG_EXTS:
+        paths += glob.glob(
+            os.path.join(folder, ext)
+        )
+
+    return sorted([
+        p for p in paths
+        if "_seg" not in os.path.basename(p).lower()
+    ])
+
+
+print(f"Stopów w datasecie: {len(df_agg)}")
+
+for _, row in df_agg.iterrows():
+    n = len(
+        get_image_paths(row["folder_path"])
+    )
+    print(
+        f"{row['folder_key']:40s} | zdjęć={n:3d}"
+    )
+
+
+backbone = models.resnet18(
+    weights=models.ResNet18_Weights.IMAGENET1K_V1
+)
+
+backbone.fc = nn.Identity()
+
+backbone.eval()
+backbone.to(DEVICE)
+
+for p in backbone.parameters():
+    p.requires_grad_(False)
+
+n_params = sum(
+    p.numel()
+    for p in backbone.parameters()
+)
+
+print(f"Parametrów: {n_params:,}")
+print(f"Embedding dim: {EMBED_DIM}D")
+
+
+transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225]
+    ),
+])
+
+
+@torch.no_grad()
+def embed_folder(folder_path):
+    paths = get_image_paths(folder_path)
+
+    if not paths:
+        return None
+
+    all_embs = []
+
+    for i in range(0, len(paths), BATCH):
+        imgs = []
+
+        for p in paths[i:i + BATCH]:
+            try:
+                imgs.append(
+                    transform(
+                        Image.open(p).convert("RGB")
+                    )
+                )
+            except Exception:
+                continue
+
+        if not imgs:
+            continue
+
+        batch_t = torch.stack(imgs).to(DEVICE)
+
+        emb = backbone(batch_t)
+
+        all_embs.append(
+            emb.cpu().numpy()
+        )
+
+    if not all_embs:
+        return None
+
+    stacked = np.vstack(all_embs)
+
+    return stacked.mean(
+        axis=0
+    ).astype(np.float32)
+
+
+embeddings = {}
+
+for cache_path in [
+    EMBED_CACHE_IN,
+    EMBED_CACHE_OUT
+]:
+    if os.path.exists(cache_path):
+        print(
+            f"Wczytuję cache: {cache_path}"
+        )
+
+        with open(cache_path) as f:
+            raw = json.load(f)
+
+        embeddings = {
+            k: np.array(v)
+            for k, v in raw.items()
+        }
+
+        print(
+            f"Załadowano {len(embeddings)} stopów z cache."
+        )
+
+        break
+
+
+missing = [
+    row
+    for _, row in df_agg.iterrows()
+    if row["folder_key"] not in embeddings
+]
+
+if missing:
+    print(
+        f"Obliczam embeddingi dla {len(missing)} stopów."
+    )
+
+    for row in missing:
+        key = row["folder_key"]
+        paths = get_image_paths(
+            row["folder_path"]
+        )
+
+        emb = embed_folder(
+            row["folder_path"]
+        )
+
+        if emb is not None:
+            embeddings[key] = emb
+
+            print(
+                f"{key:40s} | n={len(paths):3d}"
+            )
+        else:
+            print(
+                f"{key:40s} | brak zdjęć"
+            )
+
+        gc.collect()
+
+    with open(EMBED_CACHE_OUT, "w") as f:
+        json.dump(
+            {
+                k: v.tolist()
+                for k, v in embeddings.items()
+            },
+            f
+        )
+
+    print(
+        f"Cache zapisany: {EMBED_CACHE_OUT}"
+    )
+
+print(
+    f"Embeddingi: {len(embeddings)} stopów, "
+    f"dim={EMBED_DIM}"
+)
+
+
+df_agg["emb"] = df_agg[
+    "folder_key"
+].map(embeddings)
+
+df_agg = df_agg[
+    df_agg["emb"].notna()
+].reset_index(drop=True)
+
+X = np.vstack(
+    df_agg["emb"].values
+).astype(np.float32)
+
+print(
+    f"X shape: {X.shape}"
+)
+
+
+REGRESSORS = {
+    "Ridge": Pipeline([
+        ("sc", StandardScaler()),
+        ("m", Ridge(alpha=1.0)),
+    ]),
+
+    "RidgeCV": Pipeline([
+        ("sc", StandardScaler()),
+        ("m", RidgeCV(
+            alphas=ALPHAS,
+            cv=None
+        )),
+    ]),
+
+    "GBT": Pipeline([
+        ("sc", StandardScaler()),
+        ("m", GradientBoostingRegressor(
+            n_estimators=200,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.8,
+            min_samples_leaf=2,
+            random_state=SEED,
+        )),
+    ]),
+}
+
+print("Regresory:")
+
+for rn in REGRESSORS:
+    print(f"  {rn}")
+
+
+logo = LeaveOneGroupOut()
+
+all_results = []
+detail_rows = []
+
+df_reset = df_agg.reset_index(drop=True)
+
+for target in TARGETS:
+    y_full = df_reset[
+        target
+    ].values.astype(np.float32)
+
+    valid = ~np.isnan(y_full)
+    n_valid = int(valid.sum())
+
+    if n_valid < 4:
+        print(
+            f"{target}: za mało danych ({n_valid})"
+        )
+        continue
+
+    valid_pos = df_reset.index[
+        valid
+    ].tolist()
+
+    X_v = X[valid]
+    y_v = y_full[valid]
+    grp = np.arange(n_valid)
+
+    print(
+        f"\nTARGET: {target} ({n_valid} stopów)"
+    )
+
+    collector = {
+        rn: {
+            "true": [],
+            "pred": []
+        }
+        for rn in REGRESSORS
+    }
+
+    for fold_idx, (
+        train_idx,
+        test_idx
+    ) in enumerate(
+        logo.split(
+            X_v,
+            y_v,
+            groups=grp
+        )
+    ):
+        test_i = int(test_idx[0])
+
+        df_idx = valid_pos[test_i]
+
+        stop = df_reset.at[
+            df_idx,
+            "folder_key"
+        ]
+
+        true_v = float(
+            y_v[test_i]
+        )
+
+        for reg_name, reg_proto in REGRESSORS.items():
+            reg = sk_clone(reg_proto)
+
+            reg.fit(
+                X_v[train_idx],
+                y_v[train_idx]
+            )
+
+            pred = float(
+                reg.predict(
+                    X_v[test_idx]
+                )[0]
+            )
+
+            collector[
+                reg_name
+            ]["true"].append(true_v)
+
+            collector[
+                reg_name
+            ]["pred"].append(pred)
+
+            detail_rows.append({
+                "target": target,
+                "regressor": reg_name,
+                "fold": fold_idx + 1,
+                "stop": stop,
+                "true": round(true_v, 3),
+                "pred": round(pred, 3),
+                "abs_err": round(
+                    abs(true_v - pred),
+                    3
+                ),
+            })
+
+        r_pred = collector[
+            "Ridge"
+        ]["pred"][-1]
+
+        print(
+            f"F{fold_idx + 1:02d} "
+            f"[{stop:35s}] "
+            f"true={true_v:7.2f} "
+            f"Ridge={r_pred:7.2f} "
+            f"|err|={abs(true_v - r_pred):6.2f}"
+        )
+
+    print(
+        f"\n{'Regressor':10s} | "
+        f"{'R²':>7} "
+        f"{'MAE':>8} "
+        f"{'RMSE':>8}"
+    )
+
+    for reg_name in REGRESSORS:
+        yt = np.array(
+            collector[reg_name]["true"]
+        )
+
+        yp = np.array(
+            collector[reg_name]["pred"]
+        )
+
+        r2 = r2_score(yt, yp)
+
+        mae = mean_absolute_error(
+            yt,
+            yp
+        )
+
+        rmse = float(
+            np.sqrt(
+                np.mean(
+                    (yt - yp) ** 2
+                )
+            )
+        )
+
+        print(
+            f"{reg_name:10s} | "
+            f"{r2:7.3f} "
+            f"{mae:8.3f} "
+            f"{rmse:8.3f}"
+        )
+
+        all_results.append({
+            "target": target,
+            "backbone": "ResNet18-mean",
+            "regressor": reg_name,
+            "n_stops": n_valid,
+            "R2": round(r2, 4),
+            "MAE": round(mae, 4),
+            "RMSE": round(rmse, 4),
+        })
+
+
+det_df = pd.DataFrame(
+    detail_rows
+)
+
+fig, axes = plt.subplots(
+    1,
+    len(TARGETS),
+    figsize=(5 * len(TARGETS), 4.8)
+)
+
+if len(TARGETS) == 1:
+    axes = [axes]
+
+for ai, target in enumerate(TARGETS):
+    ax = axes[ai]
+
+    sub_res = [
+        r for r in all_results
+        if r["target"] == target
+    ]
+
+    if not sub_res:
+        continue
+
+    best_r = max(
+        sub_res,
+        key=lambda x: x["R2"]
+    )
+
+    best_rn = best_r[
+        "regressor"
+    ]
+
+    imp_df = det_df[
+        (det_df["target"] == target) &
+        (det_df["regressor"] == best_rn)
+    ]
+
+    if imp_df.empty:
+        continue
+
+    ax.scatter(
+        imp_df["true"],
+        imp_df["pred"],
+        s=70,
+        edgecolors="k",
+        linewidths=0.6,
+        zorder=3,
+        color=plt.cm.tab10(ai / 10)
+    )
+
+    lim = [
+        imp_df[
+            ["true", "pred"]
+        ].min().min() * 0.88,
+        imp_df[
+            ["true", "pred"]
+        ].max().max() * 1.12
+    ]
+
+    ax.plot(
+        lim,
+        lim,
+        "r--",
+        lw=1.3,
+        label="ideał"
+    )
+
+    ax.set_xlabel(
+        "Wartość rzeczywista",
+        fontsize=9
+    )
+
+    ax.set_ylabel(
+        "Predykcja",
+        fontsize=9
+    )
+
+    ax.set_title(
+        f"{target}\n"
+        f"{best_rn} "
+        f"R²={best_r['R2']:.3f} "
+        f"MAE={best_r['MAE']:.3f}",
+        fontsize=9
+    )
+
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+
+plt.suptitle(
+    "ResNet18 frozen, ImageNet, "
+    "mean embeddingów 512D\n"
+    "Ridge / RidgeCV / GBT - LOGO-CV",
+    fontsize=11
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    os.path.join(
+        RESULTS_DIR,
+        "scatter_resnet18_mean.png"
+    ),
+    dpi=130,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+print(
+    "scatter_resnet18_mean.png zapisany"
+)
+
+
+summary_df = pd.DataFrame(
+    all_results
+)
+
+summary_df.to_csv(
+    os.path.join(
+        RESULTS_DIR,
+        "summary_resnet18_mean.csv"
+    ),
+    index=False
+)
+
+det_df.to_csv(
+    os.path.join(
+        RESULTS_DIR,
+        "per_fold_resnet18_mean.csv"
+    ),
+    index=False
+)
+
+
+pivot = summary_df.pivot_table(
+    index="target",
+    columns="regressor",
+    values="R2",
+    aggfunc="max"
+)
+
+reg_order = [
+    "Ridge",
+    "RidgeCV",
+    "GBT"
+]
+
+pivot = pivot.reindex(
+    columns=[
+        r for r in reg_order
+        if r in pivot.columns
+    ]
+)
+
+print(
+    "\nR² per target i regressor"
+)
+
+print(
+    f"\n{'Target':12s} | "
+    + " | ".join(
+        f"{r:10s}"
+        for r in pivot.columns
+    )
+)
+
+for tgt, row in pivot.iterrows():
+    cells = []
+
+    for r in pivot.columns:
+        val = row.get(
+            r,
+            float("nan")
+        )
+
+        cells.append(
+            f"{val:6.3f}"
+        )
+
+    print(
+        f"{tgt:12s} | "
+        + " | ".join(cells)
+    )
+
+print(
+    f"\nWyniki: {RESULTS_DIR}/"
+)

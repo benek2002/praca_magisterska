@@ -1,0 +1,146 @@
+import os
+import numpy as np
+import pandas as pd
+import time
+
+from sklearn.compose import TransformedTargetRegressor
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.linear_model import Ridge
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import LeaveOneGroupOut
+from sklearn.metrics import r2_score, mean_absolute_error
+import xgboost as xgb
+
+MERGED_CSV = "ADI_dataset_v8.csv"
+SAVE_DIR   = "tabular_results"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+TARGETS = ['Rm_MPa', 'Rp02_MPa', 'A_pct', 'impact_J', 'HB']
+TAB_COLS = [
+    'grubosc_mm', 'T_aust_C', 't_aust_min', 'T_hart_C', 't_hart_min',
+    'chem_C', 'chem_Si', 'chem_Mn', 'chem_S', 'chem_P',
+    'chem_Mg', 'chem_Cu', 'chem_Ni'
+]
+
+
+def build_model(model_name: str, params: dict):
+    if model_name == 'GBT':
+        return GradientBoostingRegressor(**params)
+    elif model_name == 'XGBoost':
+        return xgb.XGBRegressor(**params)
+    elif model_name == 'RandomForest':
+        return RandomForestRegressor(**params)
+    elif model_name == 'Ridge':
+        return TransformedTargetRegressor(
+            regressor=Ridge(**params),
+            transformer=StandardScaler(),
+        )
+    elif model_name == 'MLP':
+        return TransformedTargetRegressor(
+            regressor=MLPRegressor(**params),
+            transformer=StandardScaler(),
+        )
+    raise ValueError(f"Nieznany model: {model_name}")
+
+
+FIXED_PARAMS = {
+    'GBT': dict(
+        n_estimators=300, max_depth=3, learning_rate=0.05,
+        subsample=0.8, random_state=42,
+    ),
+    'XGBoost': dict(
+        n_estimators=300, max_depth=3, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8,
+        random_state=42, verbosity=0,
+    ),
+    'RandomForest': dict(
+        n_estimators=300, max_depth=5,
+        random_state=42, n_jobs=-1,
+    ),
+    'Ridge': dict(alpha=1.0),
+    'MLP': dict(
+        hidden_layer_sizes=(64, 32), max_iter=500,
+        random_state=42, early_stopping=True,
+        validation_fraction=0.15, learning_rate_init=1e-3,
+    ),
+}
+
+df = pd.read_csv(MERGED_CSV)
+
+
+def extract_folder_name(x):
+    x = str(x).strip().replace('\\\\', '\\').replace('\\', '/')
+    parts = [p for p in x.split('/') if p]
+    return parts[-1] if parts else x
+
+
+df['folder_key'] = df['folder_1000x'].apply(extract_folder_name)
+available_tab    = [c for c in TAB_COLS if c in df.columns]
+agg_dict         = {col: 'first' for col in available_tab + TARGETS
+                    if col in df.columns}
+df_agg = (df.groupby('folder_key')
+            .agg(agg_dict)
+            .reset_index()
+            .reset_index(drop=True))
+
+print(f"Próbek: {len(df_agg)}")
+print(f"Cechy ({len(available_tab)}): {available_tab}\n")
+
+logo_outer  = LeaveOneGroupOut()
+all_results = []
+MODEL_NAMES = ['GBT', 'XGBoost', 'RandomForest', 'Ridge', 'MLP']
+
+for target in TARGETS:
+    sub = df_agg.dropna(subset=[target]).reset_index(drop=True)
+    X   = sub[available_tab].fillna(sub[available_tab].median()).values
+    y   = sub[target].values
+    grp = np.arange(len(sub))
+
+    print(f"\n{'='*70}")
+    print(f"TARGET: {target}  ({len(sub)} próbek)")
+
+    for model_name in MODEL_NAMES:
+        y_true_all, y_pred_all = [], []
+        t0 = time.time()
+
+        for fold_idx, (train_idx, test_idx) in enumerate(
+                logo_outer.split(sub, y, groups=grp)):
+
+            scaler  = StandardScaler()
+            X_train = scaler.fit_transform(X[train_idx])
+            X_test  = scaler.transform(X[test_idx])
+            y_train = y[train_idx]
+
+            model = build_model(model_name, FIXED_PARAMS[model_name].copy())
+            model.fit(X_train, y_train)
+            pred = float(model.predict(X_test)[0])
+
+            y_true_all.append(float(y[test_idx[0]]))
+            y_pred_all.append(pred)
+
+        elapsed = time.time() - t0
+        r2  = r2_score(np.array(y_true_all), np.array(y_pred_all))
+        mae = mean_absolute_error(np.array(y_true_all), np.array(y_pred_all))
+        all_results.append({
+            'target':    target,
+            'model':     model_name,
+            'strategy':  'A_fixed',
+            'n_samples': len(sub),
+            'R2':        round(r2, 3),
+            'MAE':       round(mae, 3),
+            'time_s':    round(elapsed, 1),
+        })
+        print(f"  {model_name:15s} [A_fixed]  "
+              f"R²={r2:.3f}  MAE={mae:.3f}  ({elapsed:.0f}s)")
+
+df_results = pd.DataFrame(all_results)
+df_results.to_csv(
+    os.path.join(SAVE_DIR, "tabular_strategy_A_fixed.csv"), index=False
+)
+
+print("\n" + "="*70)
+print("ZESTAWIENIE R² — Strategia A (stałe hiperparametry)")
+print("="*70)
+pivot = df_results.groupby(['target', 'model'])['R2'].max().unstack()
+print(pivot.to_string())

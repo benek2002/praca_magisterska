@@ -1,0 +1,701 @@
+import os
+import gc
+import glob
+import json
+import warnings
+import random
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+import torch
+from torchvision import transforms
+
+try:
+    import timm
+except ImportError:
+    os.system("pip install timm -q")
+    import timm
+
+from sklearn.linear_model import Ridge, RidgeCV
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.base import clone as sk_clone
+from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.model_selection import LeaveOneGroupOut
+from xgboost import XGBRegressor
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+
+
+ROOT_DIR = "ścieżka do obrazów"
+CSV_PATH = "ścieżka do pliku CSV"
+EMBED_CACHE_IN = "ścieżka do wejściowego cache embeddingów"
+EMBED_CACHE_OUT = "ścieżka do wyjściowego cache embeddingów"
+RESULTS_DIR = "ścieżka do wyników"
+
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+TARGETS = [
+    "Rm_MPa",
+    "Rp02_MPa",
+    "A_pct",
+    "impact_J",
+    "HB"
+]
+
+IMG_EXTS = (
+    "*.jpg",
+    "*.jpeg",
+    "*.png",
+    "*.bmp",
+    "*.tif",
+    "*.tiff"
+)
+
+SEED = 42
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH = 32
+IMG_SIZE = 224
+EMBED_DIM = 192
+
+PREV_BEST = {
+    "Rm_MPa": 0.8776,
+    "Rp02_MPa": 0.8773,
+    "A_pct": 0.6172,
+    "impact_J": 0.0,
+    "HB": 0.8474,
+}
+
+ALPHAS = [
+    0.001,
+    0.01,
+    0.1,
+    1.0,
+    10.0,
+    100.0,
+    1000.0,
+    10000.0
+]
+
+random.seed(SEED)
+np.random.seed(SEED)
+
+if torch.cuda.is_available():
+    torch.manual_seed(SEED)
+
+
+def extract_folder_name(value):
+    return str(value).strip().replace("\\", "/").split("/")[-1]
+
+
+def build_folder_path(key, root):
+    exact_path = os.path.join(root, key)
+
+    if os.path.isdir(exact_path):
+        return exact_path
+
+    if not hasattr(build_folder_path, "_map"):
+        try:
+            entries = os.listdir(root)
+        except FileNotFoundError:
+            entries = []
+
+        build_folder_path._map = {
+            entry.lower().strip(): entry
+            for entry in entries
+        }
+
+    match = build_folder_path._map.get(
+        key.lower().strip()
+    )
+
+    return (
+        os.path.join(root, match)
+        if match
+        else exact_path
+    )
+
+
+def get_image_paths(folder):
+    paths = []
+
+    for extension in IMG_EXTS:
+        paths += glob.glob(
+            os.path.join(folder, extension)
+        )
+
+    return sorted([
+        path
+        for path in paths
+        if "_seg" not in os.path.basename(path).lower()
+    ])
+
+
+df_raw = pd.read_csv(CSV_PATH)
+
+df_raw["folder_key"] = df_raw["folder_1000x"].apply(
+    extract_folder_name
+)
+
+cols_needed = [
+    "folder_key"
+] + [
+    target
+    for target in TARGETS
+    if target in df_raw.columns
+]
+
+df_agg = (
+    df_raw[cols_needed]
+    .groupby("folder_key", as_index=False)
+    .first()
+)
+
+df_agg["folder_path"] = df_agg["folder_key"].apply(
+    lambda key: build_folder_path(key, ROOT_DIR)
+)
+
+df_agg = (
+    df_agg[
+        df_agg["folder_path"].apply(os.path.isdir)
+    ]
+    .reset_index(drop=True)
+)
+
+
+backbone = timm.create_model(
+    "vit_tiny_patch16_224",
+    pretrained=True,
+    num_classes=0
+)
+
+backbone.eval().to(DEVICE)
+
+for parameter in backbone.parameters():
+    parameter.requires_grad_(False)
+
+
+transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225]
+    ),
+])
+
+
+@torch.no_grad()
+def embed_folder(folder_path):
+    paths = get_image_paths(folder_path)
+
+    if not paths:
+        return None
+
+    all_embeddings = []
+
+    for i in range(0, len(paths), BATCH):
+        images = []
+
+        for path in paths[i:i + BATCH]:
+            try:
+                image = Image.open(path).convert("RGB")
+                images.append(transform(image))
+            except Exception:
+                continue
+
+        if not images:
+            continue
+
+        batch = torch.stack(images).to(DEVICE)
+        embeddings = backbone(batch)
+
+        all_embeddings.append(
+            embeddings.cpu().numpy()
+        )
+
+    if not all_embeddings:
+        return None
+
+    stacked = np.vstack(all_embeddings)
+
+    if stacked.shape[0] == 1:
+        return np.zeros(
+            EMBED_DIM,
+            dtype=np.float32
+        )
+
+    return stacked.std(
+        axis=0,
+        ddof=0
+    ).astype(np.float32)
+
+
+embeddings = {}
+
+for cache_path in [
+    EMBED_CACHE_IN,
+    EMBED_CACHE_OUT
+]:
+    if os.path.exists(cache_path):
+        with open(cache_path) as file:
+            raw = json.load(file)
+
+        embeddings = {
+            key: np.array(value)
+            for key, value in raw.items()
+        }
+
+        break
+
+
+missing = [
+    row
+    for _, row in df_agg.iterrows()
+    if row["folder_key"] not in embeddings
+]
+
+
+if missing:
+    for row in missing:
+        key = row["folder_key"]
+
+        paths = get_image_paths(
+            row["folder_path"]
+        )
+
+        embedding = embed_folder(
+            row["folder_path"]
+        )
+
+        if embedding is not None:
+            embeddings[key] = embedding
+
+        gc.collect()
+
+    output_directory = os.path.dirname(
+        EMBED_CACHE_OUT
+    )
+
+    if output_directory:
+        os.makedirs(
+            output_directory,
+            exist_ok=True
+        )
+
+    with open(EMBED_CACHE_OUT, "w") as file:
+        json.dump(
+            {
+                key: value.tolist()
+                for key, value in embeddings.items()
+            },
+            file
+        )
+
+
+df_agg["emb"] = df_agg["folder_key"].map(
+    embeddings
+)
+
+df_agg = (
+    df_agg[
+        df_agg["emb"].notna()
+    ]
+    .reset_index(drop=True)
+)
+
+X = np.vstack(
+    df_agg["emb"].values
+).astype(np.float32)
+
+
+REGRESSORS = {
+    "Ridge": Pipeline([
+        ("sc", StandardScaler()),
+        ("m", Ridge()),
+    ]),
+
+    "RidgeCV": Pipeline([
+        ("sc", StandardScaler()),
+        ("m", RidgeCV(
+            alphas=ALPHAS,
+            cv=None
+        )),
+    ]),
+
+    "GBT": Pipeline([
+        ("sc", StandardScaler()),
+        ("m", GradientBoostingRegressor(
+            n_estimators=200,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.8,
+            min_samples_leaf=2,
+            random_state=SEED,
+        )),
+    ]),
+
+    "XGBoost": Pipeline([
+        ("sc", StandardScaler()),
+        ("m", XGBRegressor(
+            n_estimators=200,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            min_child_weight=2,
+            random_state=SEED,
+            verbosity=0,
+            tree_method="hist",
+        )),
+    ]),
+}
+
+
+logo = LeaveOneGroupOut()
+
+all_results = []
+detail_rows = []
+
+df_reset = df_agg.reset_index(drop=True)
+
+
+for target in TARGETS:
+
+    y_full = df_reset[target].values.astype(
+        np.float32
+    )
+
+    valid = ~np.isnan(y_full)
+    n_valid = int(valid.sum())
+
+    if n_valid < 4:
+        continue
+
+    valid_positions = (
+        df_reset.index[valid].tolist()
+    )
+
+    X_valid = X[valid]
+    y_valid = y_full[valid]
+    groups = np.arange(n_valid)
+
+    collector = {
+        regressor: {
+            "true": [],
+            "pred": []
+        }
+        for regressor in REGRESSORS
+    }
+
+    for fold_idx, (
+        train_idx,
+        test_idx
+    ) in enumerate(
+        logo.split(
+            X_valid,
+            y_valid,
+            groups=groups
+        )
+    ):
+
+        test_position = int(test_idx[0])
+        df_index = valid_positions[test_position]
+
+        stop = df_reset.at[
+            df_index,
+            "folder_key"
+        ]
+
+        true_value = float(
+            y_valid[test_position]
+        )
+
+        for regressor_name, regressor_template in REGRESSORS.items():
+
+            regressor = sk_clone(
+                regressor_template
+            )
+
+            regressor.fit(
+                X_valid[train_idx],
+                y_valid[train_idx]
+            )
+
+            prediction = float(
+                regressor.predict(
+                    X_valid[test_idx]
+                )[0]
+            )
+
+            collector[
+                regressor_name
+            ]["true"].append(true_value)
+
+            collector[
+                regressor_name
+            ]["pred"].append(prediction)
+
+            detail_rows.append({
+                "target": target,
+                "regressor": regressor_name,
+                "fold": fold_idx + 1,
+                "stop": stop,
+                "true": round(
+                    true_value,
+                    3
+                ),
+                "pred": round(
+                    prediction,
+                    3
+                ),
+                "abs_err": round(
+                    abs(
+                        true_value -
+                        prediction
+                    ),
+                    3
+                ),
+            })
+
+
+    previous_r2 = PREV_BEST.get(
+        target,
+        0.0
+    )
+
+    for regressor_name in REGRESSORS:
+
+        y_true = np.array(
+            collector[
+                regressor_name
+            ]["true"]
+        )
+
+        y_pred = np.array(
+            collector[
+                regressor_name
+            ]["pred"]
+        )
+
+        r2 = r2_score(
+            y_true,
+            y_pred
+        )
+
+        mae = mean_absolute_error(
+            y_true,
+            y_pred
+        )
+
+        rmse = float(
+            np.sqrt(
+                np.mean(
+                    (y_true - y_pred) ** 2
+                )
+            )
+        )
+
+        delta = r2 - previous_r2
+
+        all_results.append({
+            "target": target,
+            "backbone": "ViT-Tiny-std",
+            "regressor": regressor_name,
+            "n_stops": n_valid,
+            "R2": round(r2, 4),
+            "MAE": round(mae, 4),
+            "RMSE": round(rmse, 4),
+            "prev_best": previous_r2,
+            "delta": round(delta, 4),
+        })
+
+
+det_df = pd.DataFrame(detail_rows)
+
+fig, axes = plt.subplots(
+    1,
+    len(TARGETS),
+    figsize=(5 * len(TARGETS), 4.8)
+)
+
+if len(TARGETS) == 1:
+    axes = [axes]
+
+
+for axis_index, target in enumerate(TARGETS):
+
+    ax = axes[axis_index]
+
+    target_results = [
+        result
+        for result in all_results
+        if result["target"] == target
+    ]
+
+    if not target_results:
+        continue
+
+    best_result = max(
+        target_results,
+        key=lambda result: result["R2"]
+    )
+
+    best_regressor = best_result[
+        "regressor"
+    ]
+
+    plot_data = det_df[
+        (det_df["target"] == target) &
+        (det_df["regressor"] == best_regressor)
+    ]
+
+    if plot_data.empty:
+        continue
+
+    ax.scatter(
+        plot_data["true"],
+        plot_data["pred"],
+        s=70,
+        edgecolors="k",
+        linewidths=0.6,
+        zorder=3,
+        color=plt.cm.tab10(
+            axis_index / 10
+        )
+    )
+
+    limits = [
+        plot_data[["true", "pred"]]
+        .min()
+        .min() * 0.88,
+
+        plot_data[["true", "pred"]]
+        .max()
+        .max() * 1.12
+    ]
+
+    ax.plot(
+        limits,
+        limits,
+        "r--",
+        lw=1.3,
+        label="ideał"
+    )
+
+    ax.set_xlabel(
+        "Wartość rzeczywista",
+        fontsize=9
+    )
+
+    ax.set_ylabel(
+        "Predykcja",
+        fontsize=9
+    )
+
+    ax.set_title(
+        f"{target}\n"
+        f"{best_regressor}  "
+        f"R²={best_result['R2']:.3f}  "
+        f"MAE={best_result['MAE']:.3f}",
+        fontsize=9
+    )
+
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+
+
+plt.suptitle(
+    "ViT-Tiny Frozen, std embeddingów 192D\n"
+    "Ridge / RidgeCV / GBT / XGBoost, LOGO-CV",
+    fontsize=11
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    os.path.join(
+        RESULTS_DIR,
+        "scatter_vittiny_std.png"
+    ),
+    dpi=130,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+
+summary_df = pd.DataFrame(
+    all_results
+)
+
+summary_df.to_csv(
+    os.path.join(
+        RESULTS_DIR,
+        "summary_vittiny_std.csv"
+    ),
+    index=False
+)
+
+det_df.to_csv(
+    os.path.join(
+        RESULTS_DIR,
+        "per_fold_vittiny_std.csv"
+    ),
+    index=False
+)
+
+
+pivot = summary_df.pivot_table(
+    index="target",
+    columns="regressor",
+    values="R2",
+    aggfunc="max"
+)
+
+regressor_order = [
+    "Ridge",
+    "RidgeCV",
+    "GBT",
+    "XGBoost"
+]
+
+pivot = pivot.reindex(
+    columns=[
+        regressor
+        for regressor in regressor_order
+        if regressor in pivot.columns
+    ]
+)
+
+
+for target in TARGETS:
+
+    target_results = summary_df[
+        summary_df["target"] == target
+    ]
+
+    if target_results.empty:
+        continue
+
+    best_result = target_results.loc[
+        target_results["R2"].idxmax()
+    ]
+
+    new_r2 = float(
+        best_result["R2"]
+    )
+
+    previous_r2 = PREV_BEST.get(
+        target,
+        0.0
+    )
+
+    delta = new_r2 - previous_r2

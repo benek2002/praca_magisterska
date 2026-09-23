@@ -1,0 +1,1439 @@
+import os
+import gc
+import glob
+import random
+import json
+import shutil
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms, models
+
+from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.model_selection import LeaveOneGroupOut
+
+import cv2
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+
+import warnings
+warnings.filterwarnings("ignore")
+
+
+SEED = 42
+
+
+def set_seed(s):
+    random.seed(s)
+    np.random.seed(s)
+    torch.manual_seed(s)
+    torch.cuda.manual_seed_all(s)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+set_seed(SEED)
+
+
+ROOT_DIR = "ścieżka do obrazów"
+CSV_PATH = "ścieżka do pliku CSV"
+
+RESULTS_DIR = "ścieżka do wyników"
+GRADCAM_DIR = "ścieżka do wyników GradCAM"
+CKPT_DIR = "ścieżka do checkpointów"
+PROGRESS_DIR = "ścieżka do postępu"
+
+for d in [
+    RESULTS_DIR,
+    GRADCAM_DIR,
+    CKPT_DIR,
+    PROGRESS_DIR
+]:
+    os.makedirs(d, exist_ok=True)
+
+
+RESUME_DATASET = "ścieżka do datasetu z checkpointami"
+
+
+def restore_progress():
+    restored = 0
+
+    prev_progress = os.path.join(
+        RESUME_DATASET,
+        "progress_resnet_frozen"
+    )
+
+    if os.path.exists(prev_progress):
+        for f in glob.glob(
+            os.path.join(
+                prev_progress,
+                "*.json"
+            )
+        ):
+            dst = os.path.join(
+                PROGRESS_DIR,
+                os.path.basename(f)
+            )
+
+            if not os.path.exists(dst):
+                shutil.copy(f, dst)
+                restored += 1
+
+        print(
+            f"Skopiowano {restored} plików progress."
+        )
+    else:
+        print(
+            "Brak poprzedniego postępu."
+        )
+
+    prev_ckpt = os.path.join(
+        RESUME_DATASET,
+        "checkpoints_resnet_frozen"
+    )
+
+    if os.path.exists(prev_ckpt):
+        ckpt_copied = 0
+
+        for f in glob.glob(
+            os.path.join(
+                prev_ckpt,
+                "*.pth"
+            )
+        ):
+            dst = os.path.join(
+                CKPT_DIR,
+                os.path.basename(f)
+            )
+
+            if not os.path.exists(dst):
+                shutil.copy(f, dst)
+                ckpt_copied += 1
+
+        if ckpt_copied:
+            print(
+                f"Skopiowano {ckpt_copied} checkpointów."
+            )
+
+
+restore_progress()
+
+
+TARGETS = [
+    "Rm_MPa",
+    "Rp02_MPa",
+    "A_pct",
+    "impact_J",
+    "HB"
+]
+
+IMG_SIZE = 224
+BATCH_SIZE = 64
+EPOCHS = 30
+LR = 3e-4
+PATIENCE = 7
+GRADCAM_TOPK = 3
+
+IMG_EXTS = (
+    "*.jpg",
+    "*.jpeg",
+    "*.png",
+    "*.bmp",
+    "*.tif",
+    "*.tiff"
+)
+
+
+N_GPUS = torch.cuda.device_count()
+
+DEVICE = torch.device(
+    "cuda"
+    if torch.cuda.is_available()
+    else "cpu"
+)
+
+USE_DDP = N_GPUS > 1
+
+print(
+    f"Device: {DEVICE} | GPUs: {N_GPUS}"
+)
+
+for i in range(N_GPUS):
+    mem = (
+        torch.cuda
+        .get_device_properties(i)
+        .total_memory / 1e9
+    )
+
+    print(
+        f"GPU {i}: "
+        f"{torch.cuda.get_device_name(i)} "
+        f"({mem:.1f} GB)"
+    )
+
+
+def extract_folder_name(x):
+    return (
+        str(x)
+        .strip()
+        .replace("\\", "/")
+        .split("/")[-1]
+    )
+
+
+def get_image_paths(folder_path):
+    paths = []
+
+    for ext in IMG_EXTS:
+        paths += glob.glob(
+            os.path.join(
+                folder_path,
+                ext
+            )
+        )
+
+    return sorted(paths)
+
+
+def fold_done_path(
+    target,
+    fold_idx
+):
+    return os.path.join(
+        PROGRESS_DIR,
+        f"{target}_fold{fold_idx + 1}_done.json"
+    )
+
+
+def save_fold_result(
+    target,
+    fold_idx,
+    true_val,
+    pred_val,
+    stop_name,
+    n_imgs
+):
+    data = {
+        "target": target,
+        "fold": fold_idx + 1,
+        "stop": stop_name,
+        "true": true_val,
+        "pred": pred_val,
+        "n_imgs": n_imgs
+    }
+
+    with open(
+        fold_done_path(
+            target,
+            fold_idx
+        ),
+        "w"
+    ) as f:
+        json.dump(
+            data,
+            f
+        )
+
+
+def load_fold_result(
+    target,
+    fold_idx
+):
+    path = fold_done_path(
+        target,
+        fold_idx
+    )
+
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+
+    return None
+
+
+class StopDataset(Dataset):
+
+    def __init__(
+        self,
+        paths,
+        label_norm,
+        transform
+    ):
+        self.paths = paths
+        self.label_norm = float(
+            label_norm
+        )
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        img = Image.open(
+            self.paths[idx]
+        ).convert("RGB")
+
+        return (
+            self.transform(img),
+            torch.tensor(
+                self.label_norm,
+                dtype=torch.float32
+            )
+        )
+
+
+class MultiStopDataset(Dataset):
+
+    def __init__(
+        self,
+        path_label_pairs,
+        transform
+    ):
+        self.pairs = path_label_pairs
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        path, label = self.pairs[idx]
+
+        img = Image.open(
+            path
+        ).convert("RGB")
+
+        return (
+            self.transform(img),
+            torch.tensor(
+                float(label),
+                dtype=torch.float32
+            )
+        )
+
+
+train_transform = transforms.Compose([
+    transforms.Resize(
+        (IMG_SIZE, IMG_SIZE)
+    ),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomVerticalFlip(),
+    transforms.RandomRotation(15),
+    transforms.RandomAffine(
+        degrees=0,
+        shear=8
+    ),
+    transforms.ColorJitter(
+        brightness=0.2,
+        contrast=0.2,
+        saturation=0.1
+    ),
+    transforms.GaussianBlur(
+        kernel_size=3,
+        sigma=(0.1, 1.0)
+    ),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225]
+    )
+])
+
+
+val_transform = transforms.Compose([
+    transforms.Resize(
+        (IMG_SIZE, IMG_SIZE)
+    ),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225]
+    )
+])
+
+
+def build_model(
+    device,
+    verbose=False
+):
+    base = models.resnet18(
+        weights=models.ResNet18_Weights.IMAGENET1K_V1
+    )
+
+    for p in base.parameters():
+        p.requires_grad = False
+
+    base.fc = nn.Sequential(
+        nn.Linear(
+            base.fc.in_features,
+            128
+        ),
+        nn.ReLU(),
+        nn.Dropout(0.3),
+        nn.Linear(
+            128,
+            1
+        )
+    )
+
+    if verbose:
+        trainable = sum(
+            p.numel()
+            for p in base.parameters()
+            if p.requires_grad
+        )
+
+        total = sum(
+            p.numel()
+            for p in base.parameters()
+        )
+
+        print(
+            f"Parametry trainable: "
+            f"{trainable:,} / {total:,} "
+            f"({100 * trainable / total:.1f}%)"
+        )
+
+    if USE_DDP:
+        base = nn.DataParallel(base)
+
+    return base.to(device)
+
+
+def unwrap(model):
+    if isinstance(
+        model,
+        nn.DataParallel
+    ):
+        return model.module
+
+    return model
+
+
+class GradCAM:
+
+    def __init__(self, model):
+        self.model = unwrap(model)
+        self.activations = None
+        self.gradients = None
+
+        target = (
+            self.model
+            .layer4[-1]
+            .conv2
+        )
+
+        self._fh = (
+            target.register_forward_hook(
+                self._save_act
+            )
+        )
+
+        self._bh = (
+            target.register_full_backward_hook(
+                self._save_grad
+            )
+        )
+
+    def _save_act(
+        self,
+        module,
+        inputs,
+        output
+    ):
+        self.activations = output
+
+    def _save_grad(
+        self,
+        module,
+        grad_input,
+        grad_output
+    ):
+        self.gradients = grad_output[0]
+
+    def compute(
+        self,
+        img_tensor
+    ):
+        self.model.eval()
+        self.model.zero_grad()
+
+        with torch.enable_grad():
+            out = self.model(
+                img_tensor
+            )
+
+            out = out.mean()
+            out.backward()
+
+        if (
+            self.gradients is None
+            or self.activations is None
+        ):
+            return None
+
+        weights = self.gradients.mean(
+            dim=(2, 3),
+            keepdim=True
+        )
+
+        cam = (
+            weights
+            * self.activations
+        ).sum(
+            dim=1
+        ).squeeze(0)
+
+        cam = F.relu(
+            cam
+        ).detach().cpu().numpy()
+
+        cam -= cam.min()
+
+        if cam.max() > 0:
+            cam /= cam.max()
+
+        return cam
+
+    def remove_hooks(self):
+        self._fh.remove()
+        self._bh.remove()
+
+
+def save_gradcam_figure(
+    img_path,
+    cam,
+    pred_val,
+    true_val,
+    save_path,
+    alpha=0.5
+):
+    img = cv2.imread(
+        img_path
+    )
+
+    img = cv2.cvtColor(
+        cv2.resize(
+            img,
+            (IMG_SIZE, IMG_SIZE)
+        ),
+        cv2.COLOR_BGR2RGB
+    )
+
+    cam_r = cv2.resize(
+        cam,
+        (IMG_SIZE, IMG_SIZE)
+    )
+
+    heatmap = (
+        cm.jet(cam_r)[:, :, :3]
+        * 255
+    ).astype(np.uint8)
+
+    overlay = (
+        alpha * heatmap
+        + (1 - alpha) * img
+    ).astype(np.uint8)
+
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(13, 4)
+    )
+
+    axes[0].imshow(img)
+    axes[0].set_title(
+        "Oryginał"
+    )
+    axes[0].axis("off")
+
+    axes[1].imshow(
+        cam_r,
+        cmap="jet"
+    )
+    axes[1].set_title(
+        "GradCAM"
+    )
+    axes[1].axis("off")
+
+    axes[2].imshow(overlay)
+    axes[2].set_title(
+        f"Overlay\n"
+        f"true={true_val:.1f} "
+        f"pred={pred_val:.1f}"
+    )
+    axes[2].axis("off")
+
+    plt.tight_layout()
+
+    plt.savefig(
+        save_path,
+        dpi=120,
+        bbox_inches="tight"
+    )
+
+    plt.close()
+
+
+df = pd.read_csv(
+    CSV_PATH
+)
+
+df["folder_key"] = (
+    df["folder_1000x"]
+    .apply(extract_folder_name)
+)
+
+agg_dict = {
+    target: "first"
+    for target in TARGETS
+}
+
+df_agg = (
+    df.groupby("folder_key")
+    .agg(agg_dict)
+    .reset_index()
+)
+
+df_agg["folder_path"] = (
+    df_agg["folder_key"]
+    .apply(
+        lambda x: os.path.join(
+            ROOT_DIR,
+            x
+        )
+    )
+)
+
+df_agg = df_agg[
+    df_agg["folder_path"].apply(
+        os.path.isdir
+    )
+].reset_index(
+    drop=True
+)
+
+
+print(
+    f"Stopów: {len(df_agg)}"
+)
+
+for _, row in df_agg.iterrows():
+    n = len(
+        get_image_paths(
+            row["folder_path"]
+        )
+    )
+
+    print(
+        f"{row['folder_key']:35s} | "
+        f"zdjęć={n:3d}"
+    )
+
+
+logo = LeaveOneGroupOut()
+
+all_results = []
+detail_rows = []
+
+
+for target in TARGETS:
+
+    sub = (
+        df_agg
+        .dropna(
+            subset=[target]
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+    grp = np.arange(
+        len(sub)
+    )
+
+    y = sub[target].values.astype(
+        np.float32
+    )
+
+    print(
+        f"\nTARGET: {target} "
+        f"({len(sub)} stopów)"
+    )
+
+    build_model(
+        DEVICE,
+        verbose=True
+    )
+
+    if len(sub) < 3:
+        print(
+            "Za mało danych, pomijam"
+        )
+        continue
+
+    y_true_all = []
+    y_pred_all = []
+
+    for fold_idx in range(
+        len(sub)
+    ):
+        cached = load_fold_result(
+            target,
+            fold_idx
+        )
+
+        if cached is not None:
+            y_true_all.append(
+                cached["true"]
+            )
+
+            y_pred_all.append(
+                cached["pred"]
+            )
+
+            err = abs(
+                cached["true"]
+                - cached["pred"]
+            )
+
+            print(
+                f"Fold {fold_idx + 1:2d} "
+                f"[{cached['stop']:30s}] "
+                f"RESUME "
+                f"true={cached['true']:.1f} "
+                f"pred={cached['pred']:.1f} "
+                f"|err|={err:.1f}"
+            )
+
+            detail_rows.append({
+                "target": target,
+                "fold": fold_idx + 1,
+                "stop": cached["stop"],
+                "n_imgs": cached["n_imgs"],
+                "true": round(
+                    cached["true"],
+                    3
+                ),
+                "pred": round(
+                    cached["pred"],
+                    3
+                ),
+                "abs_err": round(
+                    err,
+                    3
+                ),
+                "rel_err_pct": round(
+                    err
+                    / (
+                        abs(
+                            cached["true"]
+                        )
+                        + 1e-8
+                    )
+                    * 100,
+                    2
+                )
+            })
+
+    for fold_idx, (
+        train_idx,
+        test_idx
+    ) in enumerate(
+        logo.split(
+            sub,
+            y,
+            groups=grp
+        )
+    ):
+
+        if load_fold_result(
+            target,
+            fold_idx
+        ) is not None:
+            continue
+
+        test_i = int(
+            test_idx[0]
+        )
+
+        test_folder = sub.loc[
+            test_i,
+            "folder_key"
+        ]
+
+        y_train = y[
+            train_idx
+        ]
+
+        y_mean = float(
+            y_train.mean()
+        )
+
+        y_std = (
+            float(
+                y_train.std()
+            )
+            + 1e-8
+        )
+
+        norm = lambda v: (
+            float(v) - y_mean
+        ) / y_std
+
+        denorm = lambda v: (
+            float(v) * y_std
+            + y_mean
+        )
+
+        rng_val = np.random.RandomState(
+            SEED + fold_idx
+        )
+
+        val_local = int(
+            rng_val.choice(
+                len(train_idx)
+            )
+        )
+
+        val_i = train_idx[
+            val_local
+        ]
+
+        pure_train = np.delete(
+            train_idx,
+            val_local
+        )
+
+        def build_train_dl(
+            indices
+        ):
+            pairs = []
+
+            for i in indices:
+                for p in get_image_paths(
+                    sub.loc[
+                        i,
+                        "folder_path"
+                    ]
+                ):
+                    pairs.append(
+                        (
+                            p,
+                            norm(y[i])
+                        )
+                    )
+
+            if not pairs:
+                return None
+
+            ds = MultiStopDataset(
+                pairs,
+                train_transform
+            )
+
+            return DataLoader(
+                ds,
+                batch_size=BATCH_SIZE,
+                shuffle=True,
+                num_workers=4,
+                pin_memory=True,
+                persistent_workers=True
+            )
+
+        def build_val_dl(i):
+            paths = get_image_paths(
+                sub.loc[
+                    i,
+                    "folder_path"
+                ]
+            )
+
+            if not paths:
+                return None
+
+            ds = StopDataset(
+                paths,
+                norm(y[i]),
+                val_transform
+            )
+
+            return DataLoader(
+                ds,
+                batch_size=BATCH_SIZE,
+                shuffle=False,
+                num_workers=4,
+                pin_memory=True,
+                persistent_workers=True
+            )
+
+        train_dl = build_train_dl(
+            pure_train
+        )
+
+        val_dl = build_val_dl(
+            val_i
+        )
+
+        test_dl = build_val_dl(
+            test_i
+        )
+
+        if (
+            train_dl is None
+            or test_dl is None
+        ):
+            print(
+                f"Fold {fold_idx + 1:2d} "
+                f"[{test_folder}] SKIP"
+            )
+            continue
+
+        model = build_model(
+            DEVICE
+        )
+
+        trainable = [
+            p
+            for p in model.parameters()
+            if p.requires_grad
+        ]
+
+        base = unwrap(
+            model
+        )
+
+        optimizer = optim.Adam(
+            base.fc.parameters(),
+            lr=LR,
+            weight_decay=1e-4
+        )
+
+        scheduler = (
+            optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=EPOCHS,
+                eta_min=LR * 0.05
+            )
+        )
+
+        criterion = nn.SmoothL1Loss()
+
+        best_val = float("inf")
+        best_state = None
+        patience_cnt = 0
+
+        for epoch in range(
+            EPOCHS
+        ):
+            model.train()
+
+            for imgs, lbls in train_dl:
+
+                imgs = imgs.to(
+                    DEVICE,
+                    non_blocking=True
+                )
+
+                lbls = lbls.to(
+                    DEVICE,
+                    non_blocking=True
+                ).unsqueeze(1)
+
+                optimizer.zero_grad()
+
+                loss = criterion(
+                    model(imgs),
+                    lbls
+                )
+
+                loss.backward()
+
+                nn.utils.clip_grad_norm_(
+                    trainable,
+                    1.0
+                )
+
+                optimizer.step()
+
+            scheduler.step()
+
+            if val_dl:
+                model.eval()
+
+                vl = []
+
+                with torch.no_grad():
+                    for imgs, lbls in val_dl:
+
+                        imgs = imgs.to(
+                            DEVICE,
+                            non_blocking=True
+                        )
+
+                        lbls = lbls.to(
+                            DEVICE,
+                            non_blocking=True
+                        ).unsqueeze(1)
+
+                        vl.append(
+                            criterion(
+                                model(imgs),
+                                lbls
+                            ).item()
+                        )
+
+                val_loss = float(
+                    np.mean(vl)
+                )
+
+                if val_loss < (
+                    best_val - 1e-4
+                ):
+                    best_val = val_loss
+
+                    best_state = {
+                        k: v.clone()
+                        for k, v
+                        in model.state_dict().items()
+                    }
+
+                    patience_cnt = 0
+
+                else:
+                    patience_cnt += 1
+
+                    if patience_cnt >= PATIENCE:
+                        print(
+                            f"Early stop @ "
+                            f"epoch {epoch + 1}"
+                        )
+                        break
+
+        if best_state:
+            model.load_state_dict(
+                best_state
+            )
+
+        model.eval()
+
+        preds_norm = []
+
+        with torch.no_grad():
+            for imgs, _ in test_dl:
+
+                imgs = imgs.to(
+                    DEVICE,
+                    non_blocking=True
+                )
+
+                out = (
+                    model(imgs)
+                    .squeeze(1)
+                    .cpu()
+                    .numpy()
+                )
+
+                preds_norm.extend(
+                    out.tolist()
+                )
+
+        pred_real = denorm(
+            float(
+                np.mean(
+                    preds_norm
+                )
+            )
+        )
+
+        true_real = float(
+            y[test_i]
+        )
+
+        err_abs = abs(
+            true_real
+            - pred_real
+        )
+
+        err_pct = (
+            err_abs
+            / (
+                abs(true_real)
+                + 1e-8
+            )
+            * 100
+        )
+
+        print(
+            f"Fold {fold_idx + 1:2d} "
+            f"[{test_folder:30s}] "
+            f"true={true_real:7.1f} "
+            f"pred={pred_real:7.1f} "
+            f"|err|={err_abs:6.1f} "
+            f"({err_pct:.1f}%)"
+        )
+
+        test_paths = get_image_paths(
+            sub.loc[
+                test_i,
+                "folder_path"
+            ]
+        )
+
+        save_fold_result(
+            target,
+            fold_idx,
+            true_real,
+            pred_real,
+            test_folder,
+            len(test_paths)
+        )
+
+        y_true_all.append(
+            true_real
+        )
+
+        y_pred_all.append(
+            pred_real
+        )
+
+        detail_rows.append({
+            "target": target,
+            "fold": fold_idx + 1,
+            "stop": test_folder,
+            "n_imgs": len(test_paths),
+            "true": round(
+                true_real,
+                3
+            ),
+            "pred": round(
+                pred_real,
+                3
+            ),
+            "abs_err": round(
+                err_abs,
+                3
+            ),
+            "rel_err_pct": round(
+                err_pct,
+                2
+            )
+        })
+
+        per_img_preds = []
+
+        gcam = GradCAM(
+            model
+        )
+
+        for img_path in test_paths:
+
+            img_t = (
+                val_transform(
+                    Image.open(
+                        img_path
+                    ).convert("RGB")
+                )
+                .unsqueeze(0)
+                .to(DEVICE)
+            )
+
+            with torch.no_grad():
+                pred_single = (
+                    unwrap(model)(
+                        img_t
+                    ).item()
+                )
+
+            per_img_preds.append(
+                (
+                    img_path,
+                    pred_single
+                )
+            )
+
+        pred_mean_norm = float(
+            np.mean(
+                preds_norm
+            )
+        )
+
+        per_img_preds.sort(
+            key=lambda x:
+                abs(
+                    x[1]
+                    - pred_mean_norm
+                )
+        )
+
+        top_paths = per_img_preds[
+            :GRADCAM_TOPK
+        ]
+
+        fold_gcam_dir = os.path.join(
+            GRADCAM_DIR,
+            target,
+            f"fold{fold_idx + 1}_"
+            f"{test_folder}"
+        )
+
+        os.makedirs(
+            fold_gcam_dir,
+            exist_ok=True
+        )
+
+        for rank, (
+            img_path,
+            img_pred_norm
+        ) in enumerate(
+            top_paths
+        ):
+
+            img_t = (
+                val_transform(
+                    Image.open(
+                        img_path
+                    ).convert("RGB")
+                )
+                .unsqueeze(0)
+                .to(DEVICE)
+            )
+
+            cam = gcam.compute(
+                img_t
+            )
+
+            if cam is not None:
+
+                fname = os.path.basename(
+                    img_path
+                )
+
+                save_gradcam_figure(
+                    img_path,
+                    cam,
+                    pred_val=denorm(
+                        img_pred_norm
+                    ),
+                    true_val=true_real,
+                    save_path=os.path.join(
+                        fold_gcam_dir,
+                        f"top{rank + 1}_"
+                        f"{fname}.png"
+                    )
+                )
+
+        gcam.remove_hooks()
+
+        torch.save(
+            {
+                "state_dict":
+                    model.state_dict(),
+                "target":
+                    target,
+                "fold":
+                    fold_idx + 1,
+                "stop":
+                    test_folder,
+                "y_mean":
+                    y_mean,
+                "y_std":
+                    y_std
+            },
+            os.path.join(
+                CKPT_DIR,
+                f"{target}_fold"
+                f"{fold_idx + 1}.pth"
+            )
+        )
+
+        del (
+            model,
+            train_dl,
+            val_dl,
+            test_dl
+        )
+
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    if len(y_true_all) < 2:
+        continue
+
+    y_t = np.array(
+        y_true_all
+    )
+
+    y_p = np.array(
+        y_pred_all
+    )
+
+    r2 = r2_score(
+        y_t,
+        y_p
+    )
+
+    mae = mean_absolute_error(
+        y_t,
+        y_p
+    )
+
+    rmse = float(
+        np.sqrt(
+            np.mean(
+                (y_t - y_p) ** 2
+            )
+        )
+    )
+
+    mape = float(
+        np.mean(
+            np.abs(
+                (y_t - y_p)
+                / (
+                    np.abs(y_t)
+                    + 1e-8
+                )
+            )
+        )
+        * 100
+    )
+
+    all_results.append({
+        "target": target,
+        "model": "ResNet18_frozen_mean",
+        "n_stops": len(
+            y_true_all
+        ),
+        "R2": round(
+            r2,
+            4
+        ),
+        "MAE": round(
+            mae,
+            3
+        ),
+        "RMSE": round(
+            rmse,
+            3
+        ),
+        "MAPE_pct": round(
+            mape,
+            2
+        )
+    })
+
+    print(
+        f"{target} "
+        f"R²={r2:.3f} "
+        f"MAE={mae:.3f} "
+        f"RMSE={rmse:.3f} "
+        f"MAPE={mape:.1f}%"
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(5, 5)
+    )
+
+    ax.scatter(
+        y_t,
+        y_p,
+        color="tomato",
+        edgecolors="k",
+        s=70,
+        zorder=3
+    )
+
+    lim = [
+        min(
+            y_t.min(),
+            y_p.min()
+        ) * 0.95,
+        max(
+            y_t.max(),
+            y_p.max()
+        ) * 1.05
+    ]
+
+    ax.plot(
+        lim,
+        lim,
+        "r--",
+        lw=1.5,
+        label="ideał"
+    )
+
+    ax.set_xlabel(
+        f"Wartość rzeczywista [{target}]"
+    )
+
+    ax.set_ylabel(
+        f"Predykcja [{target}]"
+    )
+
+    ax.set_title(
+        f"ResNet18 Frozen - {target}\n"
+        f"R²={r2:.3f}  MAE={mae:.1f}"
+    )
+
+    ax.legend()
+    ax.grid(
+        True,
+        alpha=0.3
+    )
+
+    plt.tight_layout()
+
+    plt.savefig(
+        os.path.join(
+            RESULTS_DIR,
+            f"scatter_{target}.png"
+        ),
+        dpi=150
+    )
+
+    plt.close()
+
+
+summary_df = pd.DataFrame(
+    all_results
+)
+
+summary_df.to_csv(
+    os.path.join(
+        RESULTS_DIR,
+        "summary.csv"
+    ),
+    index=False
+)
+
+pd.DataFrame(
+    detail_rows
+).to_csv(
+    os.path.join(
+        RESULTS_DIR,
+        "per_fold.csv"
+    ),
+    index=False
+)
+
+print(
+    summary_df[
+        [
+            "target",
+            "R2",
+            "MAE"
+        ]
+    ].to_string(
+        index=False
+    )
+)
